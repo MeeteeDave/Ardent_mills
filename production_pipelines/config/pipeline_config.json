@@ -1,0 +1,30 @@
+{
+  "paths": {
+    "oltp_project_root": "Ardent mill etl pipline/Ardent mill etl pipline",
+    "source_excel": "Ardent mill etl pipline/Ardent mill etl pipline/Ardent_Mills_Data.xlsx",
+    "log_dir": "production_pipelines/logs",
+    "error_dir": "production_pipelines/errors",
+    "reconciliation_dir": "production_pipelines/reconciliation",
+    "history_dir": "production_pipelines/history",
+    "log_file": "production_pipelines/logs/inc_pipeline.log",
+    "error_file": "production_pipelines/errors/inc_pipeline_errors.csv",
+    "reconciliation_file": "production_pipelines/reconciliation/inc_pipeline_reconciliation.xlsx",
+    "history_file": "production_pipelines/history/incremental_history.xlsx",
+    "snapshot_file": "production_pipelines/history/current_snapshot.json",
+    "manifest_file": "production_pipelines/logs/inc_pipeline_manifest.jsonl",
+    "control_file": "production_pipelines/logs/etl_run_control.csv",
+    "validation_workbook": "production_pipelines/reconciliation/inc_validation_workbook.xlsx",
+    "diagnostics_json": "production_pipelines/reconciliation/inc_diagnostics.json"
+  },
+  "oracle": {
+    "host": "ec2-3-111-0-185.ap-south-1.compute.amazonaws.com",
+    "port": 1521,
+    "service_name": "orcl",
+    "username": "meetee_dave_nov25",
+    "password": "meetee_dave_nov25"
+  },
+  "olap": {
+    "control_process_name": "OLAP_INCREMENTAL_LOAD",
+    "default_first_load_date": "1900-01-01"
+  }
+}
