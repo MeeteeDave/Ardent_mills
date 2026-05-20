@@ -20,6 +20,20 @@ BASE_DIR = PROJECT_DIR.parent
 CONFIG_FILE = PROJECT_DIR / "production_pipelines" / "config" / "pipeline_config.json"
 
 
+def load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_dotenv(PROJECT_DIR / ".env")
+
+
 def load_pipeline_config() -> dict[str, Any]:
     if not CONFIG_FILE.exists():
         return {}

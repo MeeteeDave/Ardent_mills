@@ -1,1 +1,7 @@
 production_pipelines/config/pipeline_config.json
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+archive_unrequired_files/
