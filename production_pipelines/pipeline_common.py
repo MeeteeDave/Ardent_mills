@@ -5,10 +5,12 @@ import csv
 import json
 import logging
 import os
+import smtplib
 import sys
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +98,84 @@ DEFAULT_ORACLE_CONFIG = {
     "username": os.getenv("ARDENT_ORACLE_USER", ORACLE_CONFIG.get("username", "")),
     "password": os.getenv("ARDENT_ORACLE_PASSWORD", ORACLE_CONFIG.get("password", "")),
 }
+
+
+def getenv_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def getenv_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    return int(value) if value else default
+
+
+def getenv_list(name: str) -> list[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+ALERT_CONFIG = {
+    "enable_email": getenv_bool("ARDENT_ALERT_ENABLE_EMAIL", False),
+    "smtp_server": os.getenv("ARDENT_ALERT_SMTP_SERVER", ""),
+    "smtp_port": getenv_int("ARDENT_ALERT_SMTP_PORT", 587),
+    "sender_email": os.getenv("ARDENT_ALERT_SENDER_EMAIL", ""),
+    "sender_password": os.getenv("ARDENT_ALERT_SENDER_PASSWORD", ""),
+    "recipient_emails": getenv_list("ARDENT_ALERT_RECIPIENT_EMAILS"),
+}
+
+
+def send_pipeline_alert(
+    pipeline_name: str,
+    run_id: str,
+    status: str,
+    message: str,
+    logger: logging.Logger,
+    exc: BaseException | None = None,
+) -> None:
+    if not ALERT_CONFIG["enable_email"]:
+        logger.info("Email alert skipped because ARDENT_ALERT_ENABLE_EMAIL is disabled")
+        return
+
+    missing = [
+        key
+        for key in ["smtp_server", "sender_email", "sender_password", "recipient_emails"]
+        if not ALERT_CONFIG[key]
+    ]
+    if missing:
+        logger.warning("Email alert skipped because SMTP config is missing: %s", ", ".join(missing))
+        return
+
+    body = [
+        f"Pipeline: {pipeline_name}",
+        f"Run ID: {run_id}",
+        f"Status: {status}",
+        "",
+        message,
+    ]
+    if exc is not None:
+        body.extend(["", f"Exception: {type(exc).__name__}: {exc}", "", traceback.format_exc()])
+
+    msg = MIMEText("\n".join(body))
+    msg["Subject"] = f"ETL {status}: {pipeline_name}"
+    msg["From"] = ALERT_CONFIG["sender_email"]
+    msg["To"] = ", ".join(ALERT_CONFIG["recipient_emails"])
+
+    try:
+        with smtplib.SMTP(ALERT_CONFIG["smtp_server"], ALERT_CONFIG["smtp_port"], timeout=30) as server:
+            server.starttls()
+            server.login(ALERT_CONFIG["sender_email"], ALERT_CONFIG["sender_password"])
+            server.sendmail(
+                ALERT_CONFIG["sender_email"],
+                ALERT_CONFIG["recipient_emails"],
+                msg.as_string(),
+            )
+        logger.info("Email alert sent: %s", msg["Subject"])
+    except Exception as alert_exc:
+        logger.exception("Failed to send email alert: %s", alert_exc)
+
 
 OLTP_TABLES = [
     "ARD_OPS_SITE",

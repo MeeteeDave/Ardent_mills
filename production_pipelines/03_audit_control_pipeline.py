@@ -12,6 +12,7 @@ from pipeline_common import (
     OLTP_TABLES,
     configure_logging,
     load_oltp_modules,
+    send_pipeline_alert,
     timestamp,
     verify_oracle_row_counts,
     write_error_record,
@@ -96,6 +97,13 @@ def main() -> None:
         logger.info("Control CSV: %s", control_csv)
         logger.info("Run manifest: %s", manifest_path)
         logger.info("Audit/control pipeline finished successfully")
+        send_pipeline_alert(
+            PIPELINE_NAME,
+            run_id,
+            "SUCCESS",
+            f"Audit/control pipeline finished successfully. Reconciliation workbook: {recon_path}",
+            logger,
+        )
 
     except Exception as exc:
         error_path = write_error_record(PIPELINE_NAME, run_id, "AUDIT_CONTROL", exc)
@@ -106,6 +114,14 @@ def main() -> None:
             {"status": "FAILED", "error_file": str(error_path), "control_csv": str(control_csv)},
         )
         logger.exception("Audit/control pipeline failed. Error file: %s", error_path)
+        send_pipeline_alert(
+            PIPELINE_NAME,
+            run_id,
+            "FAILED",
+            f"Audit/control pipeline failed. Error file: {error_path}",
+            logger,
+            exc,
+        )
         raise
 
 

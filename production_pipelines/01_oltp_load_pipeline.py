@@ -11,6 +11,7 @@ from pipeline_common import (
     add_common_args,
     configure_logging,
     load_oltp_modules,
+    send_pipeline_alert,
     timestamp,
     update_incremental_history,
     verify_oracle_row_counts,
@@ -106,6 +107,13 @@ def main() -> None:
         logger.info("Reconciliation workbook: %s", recon_path)
         logger.info("Run manifest: %s", manifest_path)
         logger.info("OLTP pipeline finished successfully")
+        send_pipeline_alert(
+            PIPELINE_NAME,
+            run_id,
+            "SUCCESS",
+            f"OLTP pipeline finished successfully. Reconciliation workbook: {recon_path}",
+            logger,
+        )
 
     except Exception as exc:
         error_path = write_error_record(PIPELINE_NAME, run_id, "OLTP_LOAD", exc)
@@ -115,6 +123,14 @@ def main() -> None:
             {"status": "FAILED", "excel": str(args.excel), "error_file": str(error_path)},
         )
         logger.exception("OLTP pipeline failed. Error file: %s", error_path)
+        send_pipeline_alert(
+            PIPELINE_NAME,
+            run_id,
+            "FAILED",
+            f"OLTP pipeline failed. Error file: {error_path}",
+            logger,
+            exc,
+        )
         raise
 
 
