@@ -22,7 +22,7 @@ import pandas as pd
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 BASE_DIR = PROJECT_DIR.parent
-CONFIG_FILE = PROJECT_DIR / "production_pipelines" / "config" / "pipeline_config.json"
+CONFIG_FILE = PROJECT_DIR / "pipelines" / "config" / "pipeline_config.json"
 
 
 def load_dotenv(path: Path) -> None:
@@ -57,7 +57,7 @@ PATH_CONFIG = PIPELINE_CONFIG.get("paths", {})
 ORACLE_CONFIG = PIPELINE_CONFIG.get("oracle", {})
 OLAP_CONFIG = PIPELINE_CONFIG.get("olap", {})
 
-PIPELINE_DIR = PROJECT_DIR / "production_pipelines"
+PIPELINE_DIR = PROJECT_DIR / "pipelines"
 LOG_DIR = configured_path(PATH_CONFIG.get("log_dir"), PIPELINE_DIR / "logs")
 ERROR_DIR = configured_path(PATH_CONFIG.get("error_dir"), PIPELINE_DIR / "errors")
 HISTORY_DIR = configured_path(PATH_CONFIG.get("history_dir"), PIPELINE_DIR / "history")
@@ -558,7 +558,6 @@ def record_audit(
                 },
             )
         conn.commit()
-        logger.info("Audit row written: %s %s (batch %s)", pipeline_name, status, batch_id)
     except Exception as exc:
         logger.warning("Could not write ETL_AUDIT row: %s", exc)
 

@@ -58,7 +58,7 @@ production_pipelines
 The single entry point is:
 
 ```text
-orchestration/run_all.py
+run_pipeline.py
 ```
 
 ## 3. Main Folder Structure
@@ -84,12 +84,9 @@ Ardent_mills/
 |   |-- config/
 |   |-- tests/
 |
-|-- orchestration/
-|   |-- run_all.py               # Single entry point
+|-- run_pipeline.py              # The only file you run
 |
-|-- production_pipelines/
-|   |-- 01_oltp_load_pipeline.py
-|   |-- 02_oltp_to_olap_incremental_pipeline.py
+|-- pipelines/
 |   |-- pipeline_common.py
 |   |-- config/
 |   |   |-- pipeline_config.json
@@ -105,7 +102,7 @@ Ardent_mills/
 The main config file is:
 
 ```text
-production_pipelines/config/pipeline_config.json
+pipelines/config/pipeline_config.json
 ```
 
 This file stores project settings such as:
@@ -136,7 +133,7 @@ ARDENT_ORACLE_PASSWORD
 File:
 
 ```text
-production_pipelines/01_oltp_load_pipeline.py
+run_pipeline.py
 ```
 
 Purpose:
@@ -167,13 +164,13 @@ Main activities:
 Safe validation command:
 
 ```powershell
-py .\production_pipelines\01_oltp_load_pipeline.py --validate-only
+py .\run_pipeline.py --validate-only
 ```
 
 Full OLTP load command:
 
 ```powershell
-py .\production_pipelines\01_oltp_load_pipeline.py
+py .\run_pipeline.py
 ```
 
 ## 6. Pipeline 2: OLTP-to-OLAP Incremental Pipeline
@@ -182,7 +179,7 @@ py .\production_pipelines\01_oltp_load_pipeline.py
 File:
 
 ```text
-production_pipelines/02_oltp_to_olap_incremental_pipeline.py
+run_pipeline.py
 ```
 
 Purpose:
@@ -229,47 +226,47 @@ INC_LOAD_FACT_BIN_CLEANING
 Full incremental command:
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py
+py .\run_pipeline.py
 ```
 
 Validation-only command:
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py --validate-only
+py .\run_pipeline.py --validate-only
 ```
 
 Skip OLTP and run only OLAP:
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py --skip-oltp
+py .\run_pipeline.py --only warehouse
 ```
 
 Skip OLAP and run only OLTP:
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py --skip-olap
+py .\run_pipeline.py --skip-olap
 ```
 
-## 7. Orchestration: run_all.py
+## 7. The Single Entry Point
 
-`orchestration/run_all.py` is the normal entry point. It runs the stages in dependency order and stops at the first failure, so the OLAP layer is never built on a half-loaded OLTP layer.
+`run_pipeline.py` is the whole pipeline. It runs both stages in order and stops at the first failure, so the warehouse is never built on a half-loaded staging layer.
 
 ```text
-Stage 1  OLTP   01_oltp_load_pipeline.py
-Stage 2  OLAP   02_oltp_to_olap_incremental_pipeline.py --skip-oltp
+STAGING    Excel workbook -> ARD_OPS_* tables
+WAREHOUSE  ARD_OPS_* -> DIM_* and FACT_*, via RUN_INCREMENTAL_OLAP_LOAD
 ```
 
-Stage 2 is invoked with `--skip-oltp` because stage 1 has already loaded the workbook; without it the Excel load would run twice.
+`--only staging` and `--only warehouse` run one stage at a time, which is useful when demonstrating the layers separately.
 
 ```powershell
-py orchestration/run_all.py                     # process whatever is in data/
-py orchestration/run_all.py --validate-only     # no database writes
-py orchestration/run_all.py --only oltp         # a single stage
-py orchestration/run_all.py --force             # reload identical bytes
-py orchestration/run_all.py -v                  # full log output
+py run_pipeline.py                     # process whatever is in data/
+py run_pipeline.py --validate-only     # no database writes
+py run_pipeline.py --only staging         # a single stage
+py run_pipeline.py --force             # reload identical bytes
+py run_pipeline.py -v                  # full log output
 ```
 
-Each stage prints one progress line with its outcome and duration. On failure the script prints the failing stage, the reason it could extract from the log, and how many stages did not run.
+`pipelines/pipeline_common.py` holds the supporting code both stages use: configuration, the table and procedure lists, file intake, and audit writing. Nothing in it runs on its own -- read `run_pipeline.py` first for the flow, then that file for the detail.
 
 ## 8. Logging
 
@@ -277,7 +274,7 @@ Each stage prints one progress line with its outcome and duration. On failure th
 The project uses one common log file:
 
 ```text
-production_pipelines/logs/inc_pipeline.log
+pipelines/logs/inc_pipeline.log
 ```
 
 Every pipeline run appends to the same file. This avoids creating a new log file for every run.
@@ -300,7 +297,7 @@ The log file records:
 All pipeline errors are written into one common error file:
 
 ```text
-production_pipelines/errors/inc_pipeline_errors.csv
+pipelines/errors/inc_pipeline_errors.csv
 ```
 
 The error file contains:
@@ -354,7 +351,7 @@ SELECT a.BATCH_ID, a.TARGET_TABLE, a.ERROR_MESSAGE, e.ERROR_TYPE
 The incremental history workbook is:
 
 ```text
-production_pipelines/history/incremental_history.xlsx
+pipelines/history/incremental_history.xlsx
 ```
 
 This file stores only detected `INSERT` and `UPDATE` changes from incremental runs.
@@ -362,7 +359,7 @@ This file stores only detected `INSERT` and `UPDATE` changes from incremental ru
 The current comparison baseline is:
 
 ```text
-production_pipelines/history/current_snapshot.json
+pipelines/history/current_snapshot.json
 ```
 
 How it works:
@@ -417,7 +414,7 @@ for all generated-ID tables.
 The manifest file is:
 
 ```text
-production_pipelines/logs/inc_pipeline_manifest.jsonl
+pipelines/logs/inc_pipeline_manifest.jsonl
 ```
 
 It stores one JSON record per pipeline run.
@@ -469,13 +466,13 @@ Schedule the single entry point. It already runs the stages in order and stops a
 Windows Task Scheduler:
 
 ```powershell
-py "C:/projects/Ardent mills/orchestration/run_all.py"
+py "C:/projects/Ardent mills/run_pipeline.py"
 ```
 
 Linux cron, daily at 02:00:
 
 ```bash
-0 2 * * * cd /path/to/Ardent_mills && python orchestration/run_all.py >> /var/log/ardent_etl.log 2>&1
+0 2 * * * cd /path/to/Ardent_mills && python run_pipeline.py >> /var/log/ardent_etl.log 2>&1
 ```
 
 Because an empty `data/` folder exits 0, a schedule can run as often as you like: runs with no new file are cheap and silent. Drop a workbook into `data/` and the next scheduled run picks it up.
@@ -488,7 +485,7 @@ Set `ARDENT_ALERT_ENABLE_EMAIL=true` in `.env` to have each run email its result
 ### Step 1: Validate transformations only
 
 ```powershell
-py .\production_pipelines\01_oltp_load_pipeline.py --validate-only
+py .\run_pipeline.py --validate-only
 ```
 
 Expected result:
@@ -501,7 +498,7 @@ Expected result:
 ### Step 2: Test OLTP load
 
 ```powershell
-py .\production_pipelines\01_oltp_load_pipeline.py
+py .\run_pipeline.py
 ```
 
 Expected result:
@@ -513,7 +510,7 @@ Expected result:
 ### Step 3: Test OLTP-to-OLAP incremental load
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py
+py .\run_pipeline.py
 ```
 
 Expected result:
@@ -526,7 +523,7 @@ Expected result:
 ### Step 4: Test the full run through the orchestrator
 
 ```powershell
-py orchestration/run_all.py
+py run_pipeline.py
 ```
 
 Expected result:
@@ -538,9 +535,9 @@ Expected result:
 ### Step 5: Test the intake guards
 
 ```powershell
-py orchestration/run_all.py                 # empty data/ -> exits 0, nothing to do
-py orchestration/run_all.py                 # same file again -> skipped by hash
-py orchestration/run_all.py --force         # reloads it anyway
+py run_pipeline.py                 # empty data/ -> exits 0, nothing to do
+py run_pipeline.py                 # same file again -> skipped by hash
+py run_pipeline.py --force         # reloads it anyway
 ```
 
 Expected result:
@@ -643,19 +640,19 @@ Project details:
 - The original OLTP ETL package is stored under ardent_mills_etl.
 - Production wrappers are stored under production_pipelines.
 - There are two production pipelines, driven by one orchestrator:
-  1. 01_oltp_load_pipeline.py: takes the workbook from data/, archives it, transforms and validates it, and loads ARD_OPS_* OLTP Oracle tables.
-  2. 02_oltp_to_olap_incremental_pipeline.py: runs the OLTP load, then RUN_INCREMENTAL_OLAP_LOAD to load DIM_* and FACT_* tables.
-  3. orchestration/run_all.py: runs both stages in order and stops at the first failure.
-- A config file named production_pipelines/config/pipeline_config.json stores paths, Oracle details, output locations, and OLAP control settings.
-- Logs are appended to production_pipelines/logs/inc_pipeline.log.
-- Errors are appended to production_pipelines/errors/inc_pipeline_errors.csv.
+  1. run_pipeline.py: takes the workbook from data/, archives it, transforms and validates it, and loads ARD_OPS_* OLTP Oracle tables.
+  2. run_pipeline.py: runs the OLTP load, then RUN_INCREMENTAL_OLAP_LOAD to load DIM_* and FACT_* tables.
+  3. run_pipeline.py: runs both stages in order and stops at the first failure.
+- A config file named pipelines/config/pipeline_config.json stores paths, Oracle details, output locations, and OLAP control settings.
+- Logs are appended to pipelines/logs/inc_pipeline.log.
+- Errors are appended to pipelines/errors/inc_pipeline_errors.csv.
 - Run history is stored in Oracle: ETL_AUDIT (run summary plus one row per target table), ETL_ERROR (one row per failure), ETL_FILE_REGISTRY (one row per source file, keyed on SHA-256), ETL_LOAD_CONTROL (the incremental watermark).
 - Source files are archived to archive/YYYY/MM/DD/ with a timestamp before being parsed; failures go to quarantine/.
-- Incremental history is stored in production_pipelines/history/incremental_history.xlsx.
-- The latest snapshot baseline is stored in production_pipelines/history/current_snapshot.json.
-- Run manifests are stored in production_pipelines/logs/inc_pipeline_manifest.jsonl.
+- Incremental history is stored in pipelines/history/incremental_history.xlsx.
+- The latest snapshot baseline is stored in pipelines/history/current_snapshot.json.
+- Run manifests are stored in pipelines/logs/inc_pipeline_manifest.jsonl.
 - ID generation has been fixed so generated IDs are preserved from the previous snapshot using business keys instead of row position.
-- The project supports scheduling by running orchestration/run_all.py; an empty data/ folder exits 0 so frequent schedules are cheap.
+- The project supports scheduling by running run_pipeline.py; an empty data/ folder exits 0 so frequent schedules are cheap.
 
 Write the documentation with these sections:
 1. Project overview

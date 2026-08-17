@@ -1,4 +1,4 @@
-production_pipelines/config/pipeline_config.json
+pipelines/config/pipeline_config.json
 .env
 .env.*
 !.env.example
@@ -7,9 +7,9 @@ __pycache__/
 archive_unrequired_files/
 
 # Generated at runtime - the database (ETL_AUDIT / ETL_ERROR) is the run history
-production_pipelines/logs/
-production_pipelines/errors/
-production_pipelines/history/incremental_history.xlsx
+pipelines/logs/
+pipelines/errors/
+pipelines/history/incremental_history.xlsx
 
 # data/ is a work queue and archive/ is local run history - neither belongs in git.
 # A reference copy of the workbook is kept in samples/.
@@ -19,4 +19,7 @@ quarantine/
 
 # Change-tracker baselines: regenerated every run, machine-specific
 ardent_mills_etl/Ardent_Mills_ETL_Snapshot.json
-production_pipelines/history/current_snapshot.json
+pipelines/history/current_snapshot.json
+
+# Unrelated teaching material that lives in this folder
+PySpark_Documentation.typ

@@ -27,9 +27,10 @@ ETL_AUDIT / ETL_ERROR / ETL_FILE_REGISTRY / ETL_LOAD_CONTROL tables, plus logs a
 
 ```text
 Ardent_mills/
+|-- run_pipeline.py              # The only file you run
 |-- .env                         # Local secrets only, ignored by Git
-|-- .env.example                 # Safe template for required environment variables
-|-- requirements.txt             # Python dependencies
+|-- .env.example
+|-- requirements.txt
 |-- README.md
 |
 |-- data/                        # Work queue: drop the new workbook here
@@ -39,38 +40,26 @@ Ardent_mills/
 |   |-- Ardent_Mills_Data.xlsx   # Reference copy of the source workbook
 |
 |-- sql/
-|   |-- 01_tables.sql            # All sequences and tables (OLTP + OLAP + ETL control)
-|   |-- 02_procedures.sql        # All incremental load procedures and wrappers
+|   |-- 01_tables.sql            # Sequences and all tables
+|   |-- 02_procedures.sql        # All INC_LOAD_* procedures and the wrapper
 |
-|-- ardent_mills_etl/            # OLTP ETL package (Excel -> ARD_OPS_* tables)
-|   |-- main.py
-|   |-- config/
-|   |-- loaders/
-|   |-- tests/
-|   |-- transformers/
-|   |-- utils/
+|-- ardent_mills_etl/            # Transform package: Excel -> ARD_OPS_* tables
+|   |-- transformers/  loaders/  utils/  config/  tests/
 |
-|-- orchestration/
-|   |-- run_all.py               # Single entry point: runs every stage in order
-|
-|-- production_pipelines/
-|   |-- 01_oltp_load_pipeline.py
-|   |-- 02_oltp_to_olap_incremental_pipeline.py
-|   |-- pipeline_common.py
+|-- pipelines/
+|   |-- pipeline_common.py       # Config, audit writing, file intake
 |   |-- config/                  # Optional pipeline_config.json, ignored by Git
-|   |-- errors/                  # Generated at runtime
-|   |-- history/
-|   |-- logs/                    # Generated at runtime
+|   |-- logs/  errors/  history/ # Generated at runtime
 |   |-- END_TO_END_DOCUMENTATION.md
 ```
 
 ## Key Components
 
 - `ardent_mills_etl`: original OLTP ETL package. It reads Excel sheets, transforms data, validates relationships, and loads Oracle `ARD_OPS_*` tables with MERGE/upsert logic.
-- `production_pipelines/01_oltp_load_pipeline.py`: production OLTP load wrapper. It runs Excel extraction, transformations, validation, Oracle load, per-table audit rows, and incremental history.
-- `production_pipelines/02_oltp_to_olap_incremental_pipeline.py`: main end-to-end incremental pipeline. It can run the OLTP load and then execute OLAP incremental procedures for `DIM_*` and `FACT_*` tables.
-- `orchestration/run_all.py`: single entry point. Runs each stage in dependency order and stops at the first failure.
-- `production_pipelines/pipeline_common.py`: shared config loading, logging, paths, Oracle config, file intake and archiving, audit/error writing, and email alerting.
+- `run_pipeline.py`: production OLTP load wrapper. It runs Excel extraction, transformations, validation, Oracle load, per-table audit rows, and incremental history.
+- `run_pipeline.py`: main end-to-end incremental pipeline. It can run the OLTP load and then execute OLAP incremental procedures for `DIM_*` and `FACT_*` tables.
+- `run_pipeline.py`: single entry point. Runs each stage in dependency order and stops at the first failure.
+- `pipelines/pipeline_common.py`: shared config loading, logging, paths, Oracle config, file intake and archiving, audit/error writing, and email alerting.
 
 ## Setup
 
@@ -118,19 +107,19 @@ Runtime secrets must live in `.env`.
 Optional path and OLAP control settings can be kept in:
 
 ```text
-production_pipelines/config/pipeline_config.json
+pipelines/config/pipeline_config.json
 ```
 
 That file is ignored by Git because it can contain environment-specific paths and connection details. Environment variables take priority over values in that JSON file.
 
 ## Email Alerts
 
-Production pipeline alerts are sent by `send_pipeline_alert` in `production_pipelines/pipeline_common.py`.
+Production pipeline alerts are sent by `send_pipeline_alert` in `pipelines/pipeline_common.py`.
 
 Alerts are sent on both success and failure for:
 
-- `01_oltp_load_pipeline.py`
-- `02_oltp_to_olap_incremental_pipeline.py`
+- `run_pipeline.py`
+- `run_pipeline.py`
 
 To enable alerts, set this in `.env`:
 
@@ -145,27 +134,27 @@ For Gmail, use an app password in `ARDENT_ALERT_SENDER_PASSWORD`. The helper log
 Safe validation only, with no Oracle writes:
 
 ```powershell
-py .\production_pipelines\01_oltp_load_pipeline.py --validate-only
+py .\run_pipeline.py --validate-only
 ```
 
 Run the main incremental pipeline:
 
 ```powershell
-py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py
+py .\run_pipeline.py
 ```
 
 Run everything end to end (the normal entry point):
 
 ```powershell
-py orchestration\run_all.py
+py run_pipeline.py
 ```
 
 Useful variants:
 
 ```powershell
-py orchestration\run_all.py --validate-only    # no database writes
-py orchestration\run_all.py --only oltp        # a single stage
-py orchestration\run_all.py -v                 # full log output
+py run_pipeline.py --validate-only    # no database writes
+py run_pipeline.py --only staging        # a single stage
+py run_pipeline.py -v                 # full log output
 ```
 
 ## Common Options
@@ -173,18 +162,18 @@ py orchestration\run_all.py -v                 # full log output
 - `--excel <path>`: override the source workbook path.
 - `--validate-only`: transform and validate without writing to Oracle.
 - `--skip-connection-test`: skip the startup Oracle connection check.
-- `--skip-oltp`: for pipeline `02`, skip the OLTP load step.
+- `--only warehouse`: for pipeline `02`, skip the OLTP load step.
 - `--skip-olap`: for pipeline `02`, skip OLAP procedure execution.
 - `--load-date "YYYY-MM-DD HH:MM:SS"`: override the previous OLAP load date.
 
 ## Runtime Outputs
 
 ```text
-production_pipelines/logs/inc_pipeline.log
-production_pipelines/logs/inc_pipeline_manifest.jsonl
-production_pipelines/errors/inc_pipeline_errors.csv
-production_pipelines/history/incremental_history.xlsx
-production_pipelines/history/current_snapshot.json
+pipelines/logs/inc_pipeline.log
+pipelines/logs/inc_pipeline_manifest.jsonl
+pipelines/errors/inc_pipeline_errors.csv
+pipelines/history/incremental_history.xlsx
+pipelines/history/current_snapshot.json
 ```
 
 ## Oracle Objects
@@ -207,14 +196,14 @@ sqlplus user/pass@dsn @sql/02_procedures.sql
 
 ## Git And Security Notes
 
-- `.env`, `production_pipelines/config/pipeline_config.json`, generated logs, histories, caches, and the `data/`, `archive/` and `quarantine/` working folders are ignored.
+- `.env`, `pipelines/config/pipeline_config.json`, generated logs, histories, caches, and the `data/`, `archive/` and `quarantine/` working folders are ignored.
 - Do not commit Oracle passwords, SMTP passwords, app passwords, or compiled `__pycache__` bytecode.
 - If a credential was ever pushed, rotate it before using the repository in a shared remote.
 
 Detailed operational documentation is available in:
 
 ```text
-production_pipelines/END_TO_END_DOCUMENTATION.md
+pipelines/END_TO_END_DOCUMENTATION.md
 ```
 
 ## Run History In The Database
@@ -272,9 +261,9 @@ A failed file goes to `quarantine/` rather than staying in `data/`, where it
 would fail every scheduled run forever and block the next good file behind it.
 
 ```powershell
-py orchestration/run_all.py                                        # process whatever is in data/
-py production_pipelines/01_oltp_load_pipeline.py --force           # reload identical bytes
-py production_pipelines/01_oltp_load_pipeline.py --excel other.xlsx # bypass the queue
+py run_pipeline.py                                        # process whatever is in data/
+py run_pipeline.py --force           # reload identical bytes
+py run_pipeline.py --excel other.xlsx # bypass the queue
 ```
 
 `--excel` bypasses the queue entirely: that file is neither archived nor removed,
