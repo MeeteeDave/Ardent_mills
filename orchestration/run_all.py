@@ -88,6 +88,8 @@ def main() -> int:
                     help="transform and validate without writing to Oracle")
     ap.add_argument("--skip-connection-test", action="store_true")
     ap.add_argument("--excel", help="override the source workbook path")
+    ap.add_argument("--force", action="store_true",
+                    help="reload even if these exact bytes already loaded")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show every log line instead of one line per stage")
     args = ap.parse_args()
@@ -99,6 +101,8 @@ def main() -> int:
         passthrough.append("--skip-connection-test")
     if args.excel:
         passthrough += ["--excel", args.excel]
+    if args.force:
+        passthrough.append("--force")
 
     chain = [s for s in STAGES if not args.only or s[0] == args.only]
 

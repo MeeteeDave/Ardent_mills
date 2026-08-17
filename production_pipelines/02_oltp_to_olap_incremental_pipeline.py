@@ -19,12 +19,12 @@ from pipeline_common import (
     parse_load_date,
     record_audit,
     record_error,
+    record_table_audit,
     send_pipeline_alert,
     timestamp,
     update_incremental_history,
     verify_oracle_row_counts,
     write_error_record,
-    write_reconciliation_workbook,
     write_run_manifest,
 )
 
@@ -238,15 +238,6 @@ def main() -> None:
                 DEFAULT_ORACLE_CONFIG,
             )
 
-        recon_path = write_reconciliation_workbook(
-            run_id=run_id,
-            pipeline_name=PIPELINE_NAME,
-            raw=raw,
-            tables=tables,
-            validation_summary=summary_df,
-            oltp_db_counts=oltp_counts,
-            olap_db_counts=olap_counts,
-        )
         manifest_path = write_run_manifest(
             PIPELINE_NAME,
             run_id,
@@ -257,10 +248,8 @@ def main() -> None:
                 "skip_oltp": args.skip_oltp,
                 "skip_olap": args.skip_olap,
                 "validate_only": args.validate_only,
-                "reconciliation_output": str(recon_path),
             },
         )
-        logger.info("Reconciliation workbook: %s", recon_path)
         logger.info("Run manifest: %s", manifest_path)
         if not args.validate_only:
             with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
@@ -274,6 +263,9 @@ def main() -> None:
                         else None
                     ),
                 )
+                record_table_audit(
+                    audit_conn, batch_id, PIPELINE_NAME, summary_df, started_at, logger
+                )
         if intake is not None:
             finish_source_intake(modules, intake, "SUCCESS", logger)
         logger.info("OLTP-to-OLAP incremental pipeline finished successfully")
@@ -281,7 +273,7 @@ def main() -> None:
             PIPELINE_NAME,
             run_id,
             "SUCCESS",
-            f"OLTP-to-OLAP incremental pipeline finished successfully. Reconciliation workbook: {recon_path}",
+            "OLTP-to-OLAP incremental pipeline finished successfully.",
             logger,
         )
 

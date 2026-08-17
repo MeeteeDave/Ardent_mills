@@ -60,14 +60,9 @@ OLAP_CONFIG = PIPELINE_CONFIG.get("olap", {})
 PIPELINE_DIR = PROJECT_DIR / "production_pipelines"
 LOG_DIR = configured_path(PATH_CONFIG.get("log_dir"), PIPELINE_DIR / "logs")
 ERROR_DIR = configured_path(PATH_CONFIG.get("error_dir"), PIPELINE_DIR / "errors")
-RECON_DIR = configured_path(PATH_CONFIG.get("reconciliation_dir"), PIPELINE_DIR / "reconciliation")
 HISTORY_DIR = configured_path(PATH_CONFIG.get("history_dir"), PIPELINE_DIR / "history")
 LOG_FILE = configured_path(PATH_CONFIG.get("log_file"), LOG_DIR / "inc_pipeline.log")
 ERROR_FILE = configured_path(PATH_CONFIG.get("error_file"), ERROR_DIR / "inc_pipeline_errors.csv")
-RECON_FILE = configured_path(
-    PATH_CONFIG.get("reconciliation_file"),
-    RECON_DIR / "inc_pipeline_reconciliation.xlsx",
-)
 HISTORY_FILE = configured_path(PATH_CONFIG.get("history_file"), HISTORY_DIR / "incremental_history.xlsx")
 SNAPSHOT_FILE = configured_path(PATH_CONFIG.get("snapshot_file"), HISTORY_DIR / "current_snapshot.json")
 MANIFEST_FILE = configured_path(
@@ -75,14 +70,6 @@ MANIFEST_FILE = configured_path(
     LOG_DIR / "inc_pipeline_manifest.jsonl",
 )
 CONTROL_FILE = configured_path(PATH_CONFIG.get("control_file"), LOG_DIR / "etl_run_control.csv")
-VALIDATION_WORKBOOK_FILE = configured_path(
-    PATH_CONFIG.get("validation_workbook"),
-    RECON_DIR / "inc_validation_workbook.xlsx",
-)
-DIAGNOSTICS_JSON_FILE = configured_path(
-    PATH_CONFIG.get("diagnostics_json"),
-    RECON_DIR / "inc_diagnostics.json",
-)
 
 OLTP_PROJECT_ROOT = configured_path(
     PATH_CONFIG.get("oltp_project_root"),
@@ -267,7 +254,7 @@ class OltpModules:
 
 
 def ensure_directories() -> None:
-    for path in [LOG_DIR, ERROR_DIR, RECON_DIR, HISTORY_DIR, CONFIG_FILE.parent]:
+    for path in [LOG_DIR, ERROR_DIR, HISTORY_DIR, CONFIG_FILE.parent]:
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -435,60 +422,6 @@ def verify_oracle_row_counts(
                     )
     return pd.DataFrame(rows)
 
-
-def write_reconciliation_workbook(
-    run_id: str,
-    pipeline_name: str,
-    raw: dict[str, pd.DataFrame] | None = None,
-    tables: dict[str, pd.DataFrame] | None = None,
-    validation_summary: pd.DataFrame | None = None,
-    oltp_db_counts: pd.DataFrame | None = None,
-    olap_db_counts: pd.DataFrame | None = None,
-) -> Path:
-    ensure_directories()
-    sheets: dict[str, pd.DataFrame] = {
-        "Run_Info": pd.DataFrame(
-            [{
-                "run_id": run_id,
-                "pipeline_name": pipeline_name,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }]
-        )
-    }
-    if raw is not None:
-        sheets["Source_Counts"] = source_counts(raw).assign(
-            run_id=run_id, pipeline_name=pipeline_name
-        )
-    if tables is not None:
-        sheets["Transformed_Counts"] = table_counts_from_dataframes(tables).assign(
-            run_id=run_id, pipeline_name=pipeline_name
-        )
-    if validation_summary is not None:
-        sheets["Validation"] = validation_summary.assign(
-            run_id=run_id, pipeline_name=pipeline_name
-        )
-    if oltp_db_counts is not None:
-        sheets["OLTP_DB_Counts"] = oltp_db_counts.assign(
-            run_id=run_id, pipeline_name=pipeline_name
-        )
-    if olap_db_counts is not None:
-        sheets["OLAP_DB_Counts"] = olap_db_counts.assign(
-            run_id=run_id, pipeline_name=pipeline_name
-        )
-
-    existing: dict[str, pd.DataFrame] = {}
-    if RECON_FILE.exists():
-        existing = pd.read_excel(RECON_FILE, sheet_name=None)
-
-    with pd.ExcelWriter(RECON_FILE, engine="openpyxl") as writer:
-        for sheet_name, df in sheets.items():
-            old = existing.get(sheet_name)
-            combined = pd.concat([old, df], ignore_index=True) if old is not None else df
-            combined.to_excel(writer, sheet_name=sheet_name, index=False)
-        for sheet_name, df in existing.items():
-            if sheet_name not in sheets:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-    return RECON_FILE
 
 
 def update_incremental_history(
@@ -952,3 +885,50 @@ def finish_source_intake(
         clear_processed_source(intake.original, logger)
     else:
         quarantine_source(intake.original, logger)
+
+
+def record_table_audit(
+    conn,
+    batch_id: str,
+    pipeline_name: str,
+    summary_df: "pd.DataFrame",
+    started_at: datetime,
+    logger: logging.Logger,
+) -> int:
+    """Write one ETL_AUDIT row per target table from the validation summary.
+
+    This is what replaced the reconciliation workbook: the same per-table grain
+    checks, in the database where every run can be compared, instead of an Excel
+    file that only existed on the machine that produced it.
+    """
+    if summary_df is None or summary_df.empty:
+        return 0
+
+    written = 0
+    for _, row in summary_df.iterrows():
+        passed = str(row.get("status", "")).upper() == "PASS"
+        record_audit(
+            conn,
+            batch_id,
+            pipeline_name,
+            "SUCCESS" if passed else "FAILED",
+            started_at,
+            logger,
+            source_object=str(row.get("source_sheet") or ""),
+            target_table=str(row.get("target_table") or ""),
+            rows_read=_safe_int(row.get("source_rows")),
+            rows_loaded=_safe_int(row.get("actual_target_rows")),
+            error_message=None if passed else str(row.get("top_reason") or "")[:4000],
+        )
+        written += 1
+    logger.info("Wrote %d per-table audit rows", written)
+    return written
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None

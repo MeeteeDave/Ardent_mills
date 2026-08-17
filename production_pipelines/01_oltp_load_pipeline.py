@@ -6,9 +6,7 @@ from pathlib import Path
 
 from pipeline_common import (
     DEFAULT_ORACLE_CONFIG,
-    DIAGNOSTICS_JSON_FILE,
     OLTP_TABLES,
-    VALIDATION_WORKBOOK_FILE,
     add_common_args,
     configure_logging,
     finish_source_intake,
@@ -17,12 +15,12 @@ from pipeline_common import (
     new_batch_id,
     record_audit,
     record_error,
+    record_table_audit,
     send_pipeline_alert,
     timestamp,
     update_incremental_history,
     verify_oracle_row_counts,
     write_error_record,
-    write_reconciliation_workbook,
     write_run_manifest,
 )
 
@@ -33,8 +31,6 @@ PIPELINE_NAME = "01_oltp_load"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Load Excel source data into ARD_OPS OLTP tables.")
     add_common_args(parser)
-    parser.add_argument("--validation-output", type=Path, default=None)
-    parser.add_argument("--diagnostics-output", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -47,9 +43,6 @@ def main() -> None:
     batch_id = new_batch_id()
     started_at = datetime.now()
     logger.info("Batch id: %s", batch_id)
-
-    validation_output = args.validation_output or VALIDATION_WORKBOOK_FILE
-    diagnostics_output = args.diagnostics_output or DIAGNOSTICS_JSON_FILE
 
     intake = intake_source_workbook(modules, args, batch_id, logger)
     if intake.skip_reason:
@@ -78,11 +71,6 @@ def main() -> None:
         summary_df = modules.summary_dataframe(raw, tables, issues)
         logger.info("Validation summary:\n%s", summary_df.to_string(index=False))
 
-        modules.write_validation_workbook(validation_output, raw, tables, issues, details)
-        modules.export_diagnostics_json(diagnostics_output, raw, tables, issues)
-        logger.info("Validation workbook: %s", validation_output)
-        logger.info("Diagnostics JSON: %s", diagnostics_output)
-
         db_counts = None
         if args.validate_only:
             logger.info("validate-only requested; skipping Oracle load")
@@ -101,27 +89,15 @@ def main() -> None:
             )
             logger.info("Incremental history workbook: %s (%d rows)", history_path, history_rows)
 
-        recon_path = write_reconciliation_workbook(
-            run_id=run_id,
-            pipeline_name=PIPELINE_NAME,
-            raw=raw,
-            tables=tables,
-            validation_summary=summary_df,
-            oltp_db_counts=db_counts,
-        )
         manifest_path = write_run_manifest(
             PIPELINE_NAME,
             run_id,
             {
                 "status": "SUCCESS",
                 "excel": str(excel_path),
-                "validation_output": str(validation_output),
-                "diagnostics_output": str(diagnostics_output),
-                "reconciliation_output": str(recon_path),
                 "validate_only": args.validate_only,
             },
         )
-        logger.info("Reconciliation workbook: %s", recon_path)
         logger.info("Run manifest: %s", manifest_path)
         if not args.validate_only:
             with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
@@ -132,13 +108,17 @@ def main() -> None:
                     rows_read=int(sum(len(df) for df in raw.values())),
                     rows_loaded=int(sum(len(df) for df in tables.values())),
                 )
+                # per-table grain checks, replacing the reconciliation workbook
+                record_table_audit(
+                    audit_conn, batch_id, PIPELINE_NAME, summary_df, started_at, logger
+                )
         finish_source_intake(modules, intake, "SUCCESS", logger)
         logger.info("OLTP pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
             run_id,
             "SUCCESS",
-            f"OLTP pipeline finished successfully. Reconciliation workbook: {recon_path}",
+            "OLTP pipeline finished successfully.",
             logger,
         )
 
