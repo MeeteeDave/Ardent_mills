@@ -4,40 +4,43 @@
 
 This project implements a production-style ETL pipeline for the Ardent Mills data warehouse.
 
-The source data comes from an Excel workbook. The pipeline transforms that source data into operational OLTP tables named `ARD_OPS_*`, then incrementally loads OLAP dimension and fact tables such as `DIM_CUSTOMER`, `DIM_PRODUCT`, `FACT_SALES`, and other reporting tables.
+The source data arrives as an Excel workbook dropped into `data/`. The pipeline archives it, transforms it into operational OLTP tables named `ARD_OPS_*`, then incrementally loads OLAP dimension and fact tables such as `DIM_CUSTOMER`, `DIM_PRODUCT` and `FACT_SALES`.
 
-The project is designed to support:
+The project supports:
 
+- File intake with archiving and a hashed file registry
 - Initial and incremental OLTP loading
-- Incremental OLTP-to-OLAP loading
-- Logging
-- Error tracking
-- Reconciliation
+- Incremental OLTP-to-OLAP loading, all dimensions before all facts
+- Run history, per-table grain checks and error detail held in Oracle
 - Incremental history capture
-- Run control/audit tracking
-- Scheduling and deployment through cron jobs
+- A single orchestration entry point
+
+Run history lives in the database (`ETL_AUDIT`, `ETL_ERROR`, `ETL_FILE_REGISTRY`, `ETL_LOAD_CONTROL`), not in local spreadsheets. A file on one machine is invisible to everyone else and is lost with that machine.
 
 ## 2. High-Level Architecture
 
 The pipeline follows this flow:
 
 ```text
-Excel Source File
+Workbook dropped into data/
         |
         v
-Original OLTP ETL Package
+Hash check -> archive raw bytes -> register file
+        |
+        v
+Original OLTP ETL Package  (reads the ARCHIVED copy)
         |
         v
 ARD_OPS_* OLTP Tables
         |
         v
-Incremental OLAP Stored Procedures
+RUN_INCREMENTAL_OLAP_LOAD  (11 dimensions, then 5 facts)
         |
         v
 DIM_* and FACT_* OLAP Tables
         |
         v
-Logs, Errors, Reconciliation, History, Audit Control
+ETL_AUDIT / ETL_ERROR / ETL_FILE_REGISTRY / ETL_LOAD_CONTROL
 ```
 
 The original OLTP package is kept as the source of truth:
@@ -52,17 +55,27 @@ The production wrapper scripts are kept here:
 production_pipelines
 ```
 
+The single entry point is:
+
+```text
+orchestration/run_all.py
+```
+
 ## 3. Main Folder Structure
+
 
 ```text
 Ardent_mills/
 |
-|-- data/
-|   |-- Ardent_Mills_Data.xlsx
+|-- data/                        # Work queue: drop the new workbook here
+|-- archive/                     # Timestamped copy of every file processed
+|-- quarantine/                  # Files that failed processing
+|-- samples/
+|   |-- Ardent_Mills_Data.xlsx   # Reference copy of the source workbook
 |
 |-- sql/
-|   |-- 01_tables.sql
-|   |-- 02_procedures.sql
+|   |-- 01_tables.sql            # Sequences and all tables
+|   |-- 02_procedures.sql        # All INC_LOAD_* procedures and the wrapper
 |
 |-- ardent_mills_etl/
 |   |-- transformers/
@@ -71,24 +84,23 @@ Ardent_mills/
 |   |-- config/
 |   |-- tests/
 |
+|-- orchestration/
+|   |-- run_all.py               # Single entry point
+|
 |-- production_pipelines/
 |   |-- 01_oltp_load_pipeline.py
 |   |-- 02_oltp_to_olap_incremental_pipeline.py
-|   |-- 03_audit_control_pipeline.py
 |   |-- pipeline_common.py
 |   |-- config/
 |   |   |-- pipeline_config.json
 |   |-- logs/
 |   |-- errors/
-|   |-- reconciliation/
 |   |-- history/
-|   |-- deploy/
-|   |-- sql/
-|   |-- README.md
 |   |-- END_TO_END_DOCUMENTATION.md
 ```
 
 ## 4. Configuration File
+
 
 The main config file is:
 
@@ -98,11 +110,10 @@ production_pipelines/config/pipeline_config.json
 
 This file stores project settings such as:
 
-- Source Excel path
+- Data, archive and quarantine folder paths
 - OLTP package path
 - Log file path
 - Error file path
-- Reconciliation file path
 - History file path
 - Oracle host, port, service name, username, and password
 - OLAP control process name
@@ -121,6 +132,7 @@ ARDENT_ORACLE_PASSWORD
 
 ## 5. Pipeline 1: OLTP Load Pipeline
 
+
 File:
 
 ```text
@@ -133,8 +145,8 @@ This pipeline reads the Excel source file, applies the original OLTP transformat
 
 Main activities:
 
-1. Reads `Ardent_Mills_Data.xlsx`.
-2. Calls the original packaged transformer functions.
+1. Discovers the workbook waiting in `data/`, hashes it, archives the raw bytes, and registers it (see section 14).
+2. Calls the original packaged transformer functions against the archived copy.
 3. Builds OLTP tables such as:
    - `ARD_OPS_SITE`
    - `ARD_OPS_PRODUCT`
@@ -148,8 +160,9 @@ Main activities:
    - `ARD_OPS_FILLORDER`
 4. Runs validation and foreign-key checks.
 5. Loads Oracle using MERGE/upsert logic.
-6. Writes reconciliation output.
+6. Writes a run summary row and one per-table grain row to `ETL_AUDIT`.
 7. Updates incremental history after successful database load.
+8. Clears the processed file from `data/`, or quarantines it on failure.
 
 Safe validation command:
 
@@ -164,6 +177,7 @@ py .\production_pipelines\01_oltp_load_pipeline.py
 ```
 
 ## 6. Pipeline 2: OLTP-to-OLAP Incremental Pipeline
+
 
 File:
 
@@ -180,11 +194,11 @@ Main activities:
 1. Reads the previous successful OLAP load date from `ETL_LOAD_CONTROL`.
 2. Runs the original packaged OLTP transformation/load step.
 3. Loads new or changed rows into `ARD_OPS_*`.
-4. Runs OLAP incremental procedures.
+4. Runs `RUN_INCREMENTAL_OLAP_LOAD`, which calls all 16 procedures in order.
 5. Updates `ETL_LOAD_CONTROL` only after successful completion.
-6. Writes logs, manifest, reconciliation, and history.
+6. Writes logs, manifest, audit rows, and history.
 
-OLAP procedure order:
+OLAP procedure order, enforced inside `RUN_INCREMENTAL_OLAP_LOAD`. Every dimension loads before any fact, because a fact resolves its foreign keys by looking the business key up in the dimension -- a fact built on a stale dimension drops or misassigns rows.
 
 Dimensions first:
 
@@ -236,39 +250,29 @@ Skip OLAP and run only OLTP:
 py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py --skip-olap
 ```
 
-## 7. Pipeline 3: Audit and Control Pipeline
+## 7. Orchestration: run_all.py
 
-File:
+`orchestration/run_all.py` is the normal entry point. It runs the stages in dependency order and stops at the first failure, so the OLAP layer is never built on a half-loaded OLTP layer.
 
 ```text
-production_pipelines/03_audit_control_pipeline.py
+Stage 1  OLTP   01_oltp_load_pipeline.py
+Stage 2  OLAP   02_oltp_to_olap_incremental_pipeline.py --skip-oltp
 ```
 
-Purpose:
-
-This pipeline creates audit/control outputs and reconciliation checks after pipeline execution.
-
-Main activities:
-
-1. Captures OLTP table row counts.
-2. Captures OLAP table row counts.
-3. Writes reconciliation results.
-4. Appends run status to the control CSV file.
-5. Writes success/failure information to the manifest.
-
-Command:
+Stage 2 is invoked with `--skip-oltp` because stage 1 has already loaded the workbook; without it the Excel load would run twice.
 
 ```powershell
-py .\production_pipelines\03_audit_control_pipeline.py
+py orchestration/run_all.py                     # process whatever is in data/
+py orchestration/run_all.py --validate-only     # no database writes
+py orchestration/run_all.py --only oltp         # a single stage
+py orchestration/run_all.py --force             # reload identical bytes
+py orchestration/run_all.py -v                  # full log output
 ```
 
-Command without database counts:
-
-```powershell
-py .\production_pipelines\03_audit_control_pipeline.py --skip-db-counts
-```
+Each stage prints one progress line with its outcome and duration. On failure the script prints the failing stage, the reason it could extract from the log, and how many stages did not run.
 
 ## 8. Logging
+
 
 The project uses one common log file:
 
@@ -286,11 +290,12 @@ The log file records:
 - Source sheet counts
 - Validation summary
 - Load status
-- Reconciliation output path
+- Batch id, archive path and audit row confirmations
 - Errors, if any
 - Pipeline completion status
 
 ## 9. Error Handling
+
 
 All pipeline errors are written into one common error file:
 
@@ -310,32 +315,41 @@ The error file contains:
 
 This helps identify which pipeline failed and why.
 
-## 10. Reconciliation
+## 10. Audit, Error And Grain Checks
 
-The reconciliation workbook is:
+Run history is written to Oracle. There is no reconciliation workbook: an Excel file only ever existed on the machine that produced it, which is the failure mode this project already suffered once.
+
+`ETL_AUDIT` carries two kinds of row per run, joined by `BATCH_ID`:
 
 ```text
-production_pipelines/reconciliation/inc_pipeline_reconciliation.xlsx
+run summary   one row: pipeline, total rows read/loaded, status, duration
+per table     one row per target table: source sheet, rows in, rows landed,
+              PASS/FAIL and the reason when it fails
 ```
 
-It stores reconciliation information in sheets such as:
+The per-table rows are the grain checks the reconciliation workbook used to hold. A collapse such as `ARD_OPS_SalesOrder read=1614 loaded=1329` is expected and explained in the row itself: SalesOrder is a header table, so multiple lines sharing an `ORDER_NO` become one header.
 
-- `Run_Info`
-- `Source_Counts`
-- `Transformed_Counts`
-- `Validation`
-- `OLTP_DB_Counts`
-- `OLAP_DB_Counts`
+`ETL_ERROR` holds one row per failure with the batch id, stage, error type, message and full traceback.
 
-Reconciliation is important because it confirms whether:
+Every audit write is wrapped. A failure to record history logs a warning and is swallowed, so the pipeline result always stands on its own.
 
-- Source rows were read correctly
-- Transformation counts match the expected grain
-- OLTP tables received data
-- OLAP tables received data
-- Validation checks passed
+```sql
+-- compare the last two runs of a pipeline
+SELECT BATCH_ID, TARGET_TABLE, ROWS_READ, ROWS_LOADED, STATUS
+  FROM ETL_AUDIT
+ WHERE PIPELINE_NAME = '01_oltp_load'
+ ORDER BY AUDIT_ID DESC;
+
+-- anything that failed, with its error
+SELECT a.BATCH_ID, a.TARGET_TABLE, a.ERROR_MESSAGE, e.ERROR_TYPE
+  FROM ETL_AUDIT a
+  LEFT JOIN ETL_ERROR e ON e.BATCH_ID = a.BATCH_ID
+ WHERE a.STATUS = 'FAILED'
+ ORDER BY a.AUDIT_ID DESC;
+```
 
 ## 11. Incremental History
+
 
 The incremental history workbook is:
 
@@ -362,6 +376,7 @@ How it works:
 This avoids creating a new history Excel file for every run.
 
 ## 12. ID Stability Fix
+
 
 Earlier, some IDs were generated based on row position. That caused a problem:
 
@@ -398,6 +413,7 @@ for all generated-ID tables.
 
 ## 13. Run Manifest
 
+
 The manifest file is:
 
 ```text
@@ -419,91 +435,55 @@ It includes:
 
 This is useful for auditing and troubleshooting.
 
-## 14. Run Control CSV
+## 14. File Intake, Archive And Registry
 
-The control file is:
-
-```text
-production_pipelines/logs/etl_run_control.csv
-```
-
-It stores audit/control status rows for pipeline runs.
-
-It helps answer:
-
-- Which run completed?
-- Which run failed?
-- Which reconciliation output belongs to that run?
-- Which error file belongs to a failed run?
-
-## 15. Deployment and Cron Scheduling
-
-For production scheduling, this project can be executed using cron jobs on a Linux server or any environment that supports cron.
-
-Recommended daily cron flow:
+`data/` is a work queue. It holds only files still waiting to be processed, and a run leaves it empty.
 
 ```text
-1. Run the OLTP-to-OLAP incremental pipeline.
-2. Run the audit/control pipeline after the incremental pipeline succeeds.
+drop the workbook into data/
+  -> SHA-256 it
+  -> identical bytes already loaded?  -> log, skip, exit 0
+  -> copy the RAW file to archive/YYYY/MM/DD/<name>_<timestamp>.xlsx
+  -> register it IN_PROGRESS in ETL_FILE_REGISTRY
+  -> process the ARCHIVED copy, not the original
+  -> success -> registry SUCCESS, original removed from data/
+  -> failure -> registry FAILED,  original moved to quarantine/
 ```
 
-Example shell script:
+The raw bytes are archived **before** anything parses them, because the archive is the replay source: if the transformer crashes, what landed must still exist. The original is removed only after the load succeeds, so the file is never in a state where it exists nowhere.
+
+The SHA-256 check protects the *watermark*, not the data. Every load is a MERGE and is safe to repeat, but reloading identical bytes stamps `UPDATED_DATE` on every row it touches, and `UPDATED_DATE` is exactly what the `INC_LOAD_*` procedures filter on. A redundant reload would therefore push the whole dataset back through the OLAP layer for nothing. `--force` overrides the skip when you genuinely want to reload.
+
+A file that fails processing moves to `quarantine/` rather than staying in `data/`, where it would fail every scheduled run forever and block the next good file behind it.
+
+Only *data* failures quarantine the file. A failure that looks like infrastructure -- `DPY-6005`, `ORA-12541`, a TNS or timeout error -- leaves the file in `data/` for the next run to retry, because the file is fine and the database was not. Quarantining on a network blip would silently empty the queue, and every later run would report "nothing to process" while looking perfectly healthy.
+
+An empty queue is success, not failure: a scheduled run with nothing to do logs and exits 0.
+
+`--excel <path>` bypasses the queue entirely. That file is neither archived nor removed, because the caller owns it.
+
+## 15. Deployment And Scheduling
+
+Schedule the single entry point. It already runs the stages in order and stops at the first failure.
+
+Windows Task Scheduler:
+
+```powershell
+py "C:/projects/Ardent mills/orchestration/run_all.py"
+```
+
+Linux cron, daily at 02:00:
 
 ```bash
-#!/bin/bash
-set -e
-
-cd "/path/to/Ardent Mills project"
-
-python production_pipelines/02_oltp_to_olap_incremental_pipeline.py
-python production_pipelines/03_audit_control_pipeline.py
+0 2 * * * cd /path/to/Ardent_mills && python orchestration/run_all.py >> /var/log/ardent_etl.log 2>&1
 ```
 
-Save this as:
+Because an empty `data/` folder exits 0, a schedule can run as often as you like: runs with no new file are cheap and silent. Drop a workbook into `data/` and the next scheduled run picks it up.
 
-```text
-production_pipelines/deploy/run_all_production_pipelines.sh
-```
-
-Make it executable:
-
-```bash
-chmod +x production_pipelines/deploy/run_all_production_pipelines.sh
-```
-
-Open cron:
-
-```bash
-crontab -e
-```
-
-Example: run every day at 2:00 AM:
-
-```cron
-0 2 * * * "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/deploy/run_all_production_pipelines.sh" >> "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/logs/cron.log" 2>&1
-```
-
-Example: run every 6 hours:
-
-```cron
-0 */6 * * * "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/deploy/run_all_production_pipelines.sh" >> "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/logs/cron.log" 2>&1
-```
-
-Example: run every weekday at 1:30 AM:
-
-```cron
-30 1 * * 1-5 "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/deploy/run_all_production_pipelines.sh" >> "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/logs/cron.log" 2>&1
-```
-
-Example: run every minute for testing:
-
-```cron
-* * * * * "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/deploy/run_all_production_pipelines.sh" >> "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project/production_pipelines/logs/cron.log" 2>&1
-```
-
-In a real production environment, the cron frequency can be daily, hourly, or based on source file arrival requirements.
+Set `ARDENT_ALERT_ENABLE_EMAIL=true` in `.env` to have each run email its result.
 
 ## 16. How to Test the Pipeline
+
 
 ### Step 1: Validate transformations only
 
@@ -513,9 +493,9 @@ py .\production_pipelines\01_oltp_load_pipeline.py --validate-only
 
 Expected result:
 
-- No Oracle load
-- Validation summary generated
-- Reconciliation workbook updated
+- No Oracle load, and no audit rows written
+- Validation summary printed, all 18 target tables PASS
+- The workbook is read in place: not archived, not removed from `data/`
 - Log file updated
 
 ### Step 2: Test OLTP load
@@ -543,19 +523,44 @@ Expected result:
 - `DIM_*` and `FACT_*` tables updated
 - `ETL_LOAD_CONTROL` updated after success
 
-### Step 4: Test audit/control
+### Step 4: Test the full run through the orchestrator
 
 ```powershell
-py .\production_pipelines\03_audit_control_pipeline.py
+py orchestration/run_all.py
 ```
 
 Expected result:
 
-- OLTP and OLAP counts captured
-- Reconciliation workbook updated
-- Control CSV updated
+- Both stages report `ok` with a duration
+- The workbook is archived and removed from `data/`
+- `ETL_AUDIT` gains a run summary row plus one row per target table
+
+### Step 5: Test the intake guards
+
+```powershell
+py orchestration/run_all.py                 # empty data/ -> exits 0, nothing to do
+py orchestration/run_all.py                 # same file again -> skipped by hash
+py orchestration/run_all.py --force         # reloads it anyway
+```
+
+Expected result:
+
+- An empty queue is a success, not a failure
+- Identical bytes are skipped with a message naming the earlier archive
+- `--force` reloads and writes a fresh `ETL_FILE_REGISTRY` row
+
+Verify in Oracle:
+
+```sql
+SELECT FILE_NAME, SUBSTR(FILE_HASH,1,12), STATUS, ARCHIVE_PATH
+  FROM ETL_FILE_REGISTRY ORDER BY FILE_ID DESC;
+
+SELECT BATCH_ID, TARGET_TABLE, ROWS_READ, ROWS_LOADED, STATUS
+  FROM ETL_AUDIT ORDER BY AUDIT_ID DESC;
+```
 
 ## 17. Useful Oracle Validation Queries
+
 
 Check OLTP sales order:
 
@@ -609,6 +614,7 @@ SELECT 'FACT_MILL_PRODUCTION', COUNT(*) FROM fact_mill_production;
 
 ## 18. Presentation Summary
 
+
 This project converts a raw Excel-based ETL process into a production-style pipeline.
 
 Key improvements:
@@ -626,29 +632,30 @@ Key improvements:
 
 ## 19. Documentation/Presentation Prompt
 
+
 Use this prompt if you want to generate a polished report or presentation:
 
 ```text
 Create a professional end-to-end project documentation and presentation for an Ardent Mills ETL pipeline project.
 
 Project details:
-- Source data comes from an Excel workbook named Ardent_Mills_Data.xlsx.
+- Source data comes from an Excel workbook dropped into the data/ folder, which acts as a work queue.
 - The original OLTP ETL package is stored under ardent_mills_etl.
 - Production wrappers are stored under production_pipelines.
-- There are three production pipelines:
-  1. 01_oltp_load_pipeline.py: reads Excel, transforms data, validates it, and loads ARD_OPS_* OLTP Oracle tables.
-  2. 02_oltp_to_olap_incremental_pipeline.py: runs OLTP load first, then runs incremental OLAP stored procedures to load DIM_* and FACT_* tables.
-  3. 03_audit_control_pipeline.py: captures row counts, reconciliation, control status, and audit outputs.
+- There are two production pipelines, driven by one orchestrator:
+  1. 01_oltp_load_pipeline.py: takes the workbook from data/, archives it, transforms and validates it, and loads ARD_OPS_* OLTP Oracle tables.
+  2. 02_oltp_to_olap_incremental_pipeline.py: runs the OLTP load, then RUN_INCREMENTAL_OLAP_LOAD to load DIM_* and FACT_* tables.
+  3. orchestration/run_all.py: runs both stages in order and stops at the first failure.
 - A config file named production_pipelines/config/pipeline_config.json stores paths, Oracle details, output locations, and OLAP control settings.
 - Logs are appended to production_pipelines/logs/inc_pipeline.log.
 - Errors are appended to production_pipelines/errors/inc_pipeline_errors.csv.
-- Reconciliation is stored in production_pipelines/reconciliation/inc_pipeline_reconciliation.xlsx.
+- Run history is stored in Oracle: ETL_AUDIT (run summary plus one row per target table), ETL_ERROR (one row per failure), ETL_FILE_REGISTRY (one row per source file, keyed on SHA-256), ETL_LOAD_CONTROL (the incremental watermark).
+- Source files are archived to archive/YYYY/MM/DD/ with a timestamp before being parsed; failures go to quarantine/.
 - Incremental history is stored in production_pipelines/history/incremental_history.xlsx.
 - The latest snapshot baseline is stored in production_pipelines/history/current_snapshot.json.
 - Run manifests are stored in production_pipelines/logs/inc_pipeline_manifest.jsonl.
-- Run control status is stored in production_pipelines/logs/etl_run_control.csv.
 - ID generation has been fixed so generated IDs are preserved from the previous snapshot using business keys instead of row position.
-- The project supports scheduling using cron jobs.
+- The project supports scheduling by running orchestration/run_all.py; an empty data/ folder exits 0 so frequent schedules are cheap.
 
 Write the documentation with these sections:
 1. Project overview

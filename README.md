@@ -272,10 +272,9 @@ A failed file goes to `quarantine/` rather than staying in `data/`, where it
 would fail every scheduled run forever and block the next good file behind it.
 
 ```powershell
-py orchestration
-un_all.py                 # process whatever is in data/
-py production_pipelines_oltp_load_pipeline.py --force    # reload identical bytes
-py production_pipelines_oltp_load_pipeline.py --excel path	o\other.xlsx
+py orchestration/run_all.py                                        # process whatever is in data/
+py production_pipelines/01_oltp_load_pipeline.py --force           # reload identical bytes
+py production_pipelines/01_oltp_load_pipeline.py --excel other.xlsx # bypass the queue
 ```
 
 `--excel` bypasses the queue entirely: that file is neither archived nor removed,

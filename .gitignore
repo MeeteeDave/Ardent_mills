@@ -16,3 +16,7 @@ production_pipelines/history/incremental_history.xlsx
 data/*.xlsx
 archive/
 quarantine/
+
+# Change-tracker baselines: regenerated every run, machine-specific
+ardent_mills_etl/Ardent_Mills_ETL_Snapshot.json
+production_pipelines/history/current_snapshot.json

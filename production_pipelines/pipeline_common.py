@@ -69,7 +69,6 @@ MANIFEST_FILE = configured_path(
     PATH_CONFIG.get("manifest_file"),
     LOG_DIR / "inc_pipeline_manifest.jsonl",
 )
-CONTROL_FILE = configured_path(PATH_CONFIG.get("control_file"), LOG_DIR / "etl_run_control.csv")
 
 OLTP_PROJECT_ROOT = configured_path(
     PATH_CONFIG.get("oltp_project_root"),
@@ -787,6 +786,36 @@ def clear_processed_source(source: Path, logger: logging.Logger) -> None:
         logger.warning("Could not remove %s from the data folder: %s", source.name, exc)
 
 
+# Failures that mean "try again later", not "this file is bad". A file is only
+# pulled out of the queue when the DATA is the problem; anything that looks like
+# a connection, listener or timeout failure leaves it in place for the next run.
+RETRYABLE_MARKERS = (
+    "DPY-6005",      # cannot connect to database
+    "DPY-4011",      # connection to the database was lost
+    "DPY-3010",      # timeout
+    "ORA-12154",     # TNS could not resolve connect identifier
+    "ORA-12170",     # TNS connect timeout
+    "ORA-12541",     # TNS no listener
+    "ORA-12514",     # listener does not know of service
+    "ORA-01033",     # instance starting up or shutting down
+    "ORA-03113",     # end-of-file on communication channel
+    "ORA-03114",     # not connected to Oracle
+    "ORA-28000",     # account locked
+    "TNS:",
+    "OperationalError",
+    "cannot connect",
+    "Connection refused",
+    "timed out",
+)
+
+
+def is_retryable_error(error_message: str | None) -> bool:
+    if not error_message:
+        return False
+    haystack = error_message.lower()
+    return any(marker.lower() in haystack for marker in RETRYABLE_MARKERS)
+
+
 def quarantine_source(source: Path, logger: logging.Logger) -> Path | None:
     """Move a file that failed processing out of the queue.
 
@@ -883,6 +912,16 @@ def finish_source_intake(
         return
     if status == "SUCCESS":
         clear_processed_source(intake.original, logger)
+    elif is_retryable_error(error_message):
+        # The file is fine; the infrastructure was not. Quarantining here would
+        # silently empty the queue after a network blip, and every later run
+        # would report "nothing to process" while looking perfectly healthy.
+        logger.warning(
+            "Leaving %s in the data folder to retry: the failure looks like an "
+            "infrastructure problem, not a bad file (%s)",
+            intake.original.name,
+            (error_message or "")[:120],
+        )
     else:
         quarantine_source(intake.original, logger)
 
