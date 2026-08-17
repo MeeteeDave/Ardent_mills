@@ -9,9 +9,9 @@ from pipeline_common import (
     OLTP_TABLES,
     add_common_args,
     configure_logging,
-    finish_source_intake,
-    intake_source_workbook,
     load_oltp_modules,
+    release_file,
+    take_next_file,
     new_batch_id,
     record_audit,
     record_error,
@@ -44,7 +44,7 @@ def main() -> None:
     started_at = datetime.now()
     logger.info("Batch id: %s", batch_id)
 
-    intake = intake_source_workbook(modules, args, batch_id, logger)
+    intake = take_next_file(modules, args, batch_id, logger)
     if intake.skip_reason:
         logger.info("Nothing to process: %s", intake.skip_reason)
         logger.info("OLTP pipeline finished with no work to do")
@@ -112,7 +112,7 @@ def main() -> None:
                 record_table_audit(
                     audit_conn, batch_id, PIPELINE_NAME, summary_df, started_at, logger
                 )
-        finish_source_intake(modules, intake, "SUCCESS", logger)
+        release_file(modules, intake, "SUCCESS", logger)
         logger.info("OLTP pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
@@ -143,9 +143,7 @@ def main() -> None:
                     )
             except Exception as audit_exc:
                 logger.warning("Could not record failure in the database: %s", audit_exc)
-        finish_source_intake(
-            modules, intake, "FAILED", logger, f"{type(exc).__name__}: {exc}"
-        )
+        release_file(modules, intake, "FAILED", logger, f"{type(exc).__name__}: {exc}")
         logger.exception("OLTP pipeline failed. Error file: %s", error_path)
         send_pipeline_alert(
             PIPELINE_NAME,

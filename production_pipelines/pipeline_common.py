@@ -616,27 +616,40 @@ def get_watermark(conn, process_name: str) -> datetime | None:
 
 # ------------------------------------------------- source file intake/archive
 # data/ is a work queue: it holds only files still waiting to be processed.
-# A run discovers the workbook there, archives the RAW bytes before parsing
-# anything (the archive is the replay source, so it must survive a crash in the
-# transformer), processes the archived copy, and only then clears data/.
 #
-# The archive is date-partitioned and timestamped, so re-dropping a file never
-# overwrites an earlier archive.
+# take_next_file() does the whole intake in one readable pass:
+#   find the file -> hash it -> skip if already loaded -> archive the raw bytes
+#   -> record it in ETL_FILE_REGISTRY -> hand back the archived copy to read.
 #
-# ETL_FILE_REGISTRY holds a SHA-256 per processed file. Reprocessing the same
-# bytes is harmless to the data -- every load is a MERGE -- but it stamps
-# UPDATED_DATE on every row it touches, and UPDATED_DATE is exactly what the
-# INC_LOAD_* procedures filter on. So a redundant reload would push the whole
-# dataset back through the OLAP layer for nothing. The hash turns that into a
-# logged skip.
+# The raw bytes are archived BEFORE anything parses them, because the archive is
+# the replay source: if the transformer crashes, what landed must still exist.
+#
+# release_file() closes the queue entry when the run ends.
 
 ARCHIVE_DIR = configured_path(PATH_CONFIG.get("archive_dir"), PROJECT_DIR / "archive")
 QUARANTINE_DIR = configured_path(PATH_CONFIG.get("quarantine_dir"), PROJECT_DIR / "quarantine")
 DATA_DIR = configured_path(PATH_CONFIG.get("data_dir"), PROJECT_DIR / "data")
 
+# Failures that mean "try again later" rather than "this file is bad". Only a
+# bad file leaves the queue: quarantining after a network blip would empty
+# data/, and every later run would report "nothing to process" while looking
+# perfectly healthy.
+RETRYABLE_ERRORS = (
+    "DPY-6005", "DPY-4011", "DPY-3010",      # driver: connect / lost / timeout
+    "ORA-12154", "ORA-12170", "ORA-12541",   # TNS: resolve / timeout / listener
+    "ORA-12514", "ORA-01033", "ORA-03113",   # service / starting up / channel
+    "ORA-03114", "ORA-28000", "TNS:",
+    "OperationalError", "cannot connect", "connection refused", "timed out",
+)
 
-class NoSourceFile(Exception):
-    """No workbook waiting in data/. Normal for a scheduled run, not a failure."""
+
+@dataclass
+class SourceIntake:
+    """What a run is processing, and what to clean up when it finishes."""
+    path: Path | None = None           # the archived copy, which the run reads
+    original: Path | None = None       # the file in data/, cleared on success
+    file_id: int | None = None         # its ETL_FILE_REGISTRY row
+    skip_reason: str | None = None     # set when there is nothing to do
 
 
 def file_sha256(path: Path) -> str:
@@ -647,283 +660,147 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def discover_source_workbook(data_dir: Path | None = None) -> Path:
-    """Find the one workbook waiting in data/.
-
-    Raises NoSourceFile when the queue is empty, and refuses to guess when more
-    than one file is waiting -- picking one arbitrarily would silently load the
-    wrong month.
-    """
-    data_dir = data_dir or DATA_DIR
-    if not data_dir.exists():
-        raise NoSourceFile(f"Data folder does not exist: {data_dir}")
-
-    candidates = sorted(
-        p for p in data_dir.glob("*.xlsx") if p.is_file() and not p.name.startswith("~$")
-    )
-    if not candidates:
-        raise NoSourceFile(f"No .xlsx waiting in {data_dir}")
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates)
-        raise RuntimeError(
-            f"{len(candidates)} workbooks in {data_dir} ({names}). "
-            "Leave exactly one, or pass --excel to choose explicitly."
-        )
-    return candidates[0]
-
-
-def archive_source_file(source: Path, logger: logging.Logger) -> Path:
-    """Copy the raw file into archive/YYYY/MM/DD/ under a timestamped name.
-
-    Copy, then verify the bytes landed, before any caller deletes the original.
-    """
-    stamp = datetime.now()
-    target_dir = ARCHIVE_DIR / f"{stamp:%Y}" / f"{stamp:%m}" / f"{stamp:%d}"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / f"{source.stem}_{stamp:%Y-%m-%d_%H-%M-%S}{source.suffix}"
-
-    shutil.copy2(source, target)
-    if target.stat().st_size != source.stat().st_size:
-        raise RuntimeError(f"Archive copy size mismatch: {target}")
-
-    logger.info("Archived source file: %s", target)
-    return target
-
-
-def registry_previous_success(conn, file_hash: str) -> tuple[str, str] | None:
-    """Return (archive_path, processed_at) if these exact bytes already loaded."""
-    with conn.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT ARCHIVE_PATH, TO_CHAR(PROCESSED_AT, 'YYYY-MM-DD HH24:MI:SS')
-              FROM ETL_FILE_REGISTRY
-             WHERE FILE_HASH = :h AND STATUS = 'SUCCESS'
-             ORDER BY FILE_ID DESC
-             FETCH FIRST 1 ROWS ONLY
-            """,
-            {"h": file_hash},
-        )
-        return cursor.fetchone()
-
-
-def registry_register(
-    conn,
-    batch_id: str,
-    source: Path,
-    file_hash: str,
-    archive_path: Path | None,
-    logger: logging.Logger,
-) -> int | None:
-    """Record the file as IN_PROGRESS; returns its FILE_ID."""
-    try:
-        with conn.cursor() as cursor:
-            # the bind variable must come from the cursor that executes the
-            # statement, or the RETURNING clause has nothing to write into
-            file_id = cursor.var(int)
-            cursor.execute(
-                """
-                INSERT INTO ETL_FILE_REGISTRY (
-                    FILE_NAME, FILE_HASH, FILE_SIZE, ARCHIVE_PATH, STATUS, BATCH_ID
-                ) VALUES (
-                    :file_name, :file_hash, :file_size, :archive_path,
-                    'IN_PROGRESS', :batch_id
-                ) RETURNING FILE_ID INTO :new_file_id
-                """,
-                {
-                    # SIZE is an Oracle reserved word, so bind names are prefixed
-                    "file_name": source.name,
-                    "file_hash": file_hash,
-                    "file_size": source.stat().st_size,
-                    "archive_path": str(archive_path) if archive_path else None,
-                    "batch_id": batch_id,
-                    "new_file_id": file_id,
-                },
-            )
-        conn.commit()
-        return int(file_id.getvalue()[0])
-    except Exception as exc:
-        logger.warning("Could not register source file: %s", exc)
-        return None
-
-
-def registry_finish(
-    conn,
-    file_id: int | None,
-    status: str,
-    logger: logging.Logger,
-    error_message: str | None = None,
-) -> None:
-    if file_id is None:
-        return
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE ETL_FILE_REGISTRY
-                   SET STATUS = :status,
-                       PROCESSED_AT = SYSTIMESTAMP,
-                       ERROR_MESSAGE = :error_message
-                 WHERE FILE_ID = :file_id
-                """,
-                {
-                    "status": status,
-                    "error_message": (error_message or "")[:4000] or None,
-                    "file_id": file_id,
-                },
-            )
-        conn.commit()
-        logger.info("File registry updated: FILE_ID=%s %s", file_id, status)
-    except Exception as exc:
-        logger.warning("Could not update file registry: %s", exc)
-
-
-def clear_processed_source(source: Path, logger: logging.Logger) -> None:
-    """Remove the original from data/ once it is safely archived and loaded."""
-    try:
-        source.unlink()
-        logger.info("Removed %s from the data folder (archived copy retained)", source.name)
-    except Exception as exc:
-        logger.warning("Could not remove %s from the data folder: %s", source.name, exc)
-
-
-# Failures that mean "try again later", not "this file is bad". A file is only
-# pulled out of the queue when the DATA is the problem; anything that looks like
-# a connection, listener or timeout failure leaves it in place for the next run.
-RETRYABLE_MARKERS = (
-    "DPY-6005",      # cannot connect to database
-    "DPY-4011",      # connection to the database was lost
-    "DPY-3010",      # timeout
-    "ORA-12154",     # TNS could not resolve connect identifier
-    "ORA-12170",     # TNS connect timeout
-    "ORA-12541",     # TNS no listener
-    "ORA-12514",     # listener does not know of service
-    "ORA-01033",     # instance starting up or shutting down
-    "ORA-03113",     # end-of-file on communication channel
-    "ORA-03114",     # not connected to Oracle
-    "ORA-28000",     # account locked
-    "TNS:",
-    "OperationalError",
-    "cannot connect",
-    "Connection refused",
-    "timed out",
-)
-
-
-def is_retryable_error(error_message: str | None) -> bool:
-    if not error_message:
-        return False
-    haystack = error_message.lower()
-    return any(marker.lower() in haystack for marker in RETRYABLE_MARKERS)
-
-
-def quarantine_source(source: Path, logger: logging.Logger) -> Path | None:
-    """Move a file that failed processing out of the queue.
-
-    A bad file left in data/ would fail every scheduled run forever and block
-    the next good file behind it.
-    """
-    try:
-        QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
-        target = QUARANTINE_DIR / f"{source.stem}_{datetime.now():%Y-%m-%d_%H-%M-%S}{source.suffix}"
-        shutil.move(str(source), str(target))
-        logger.warning("Moved failed file to quarantine: %s", target)
-        return target
-    except Exception as exc:
-        logger.warning("Could not quarantine %s: %s", source.name, exc)
-        return None
-
-
-@dataclass
-class SourceIntake:
-    """Outcome of resolving which workbook a run should process."""
-    path: Path | None          # what to actually read (the archived copy)
-    original: Path | None      # the file in data/, cleared only on success
-    archive_path: Path | None
-    file_id: int | None
-    file_hash: str | None
-    skip_reason: str | None = None   # set when there is nothing to do
-
-
-def intake_source_workbook(
-    modules: "OltpModules",
-    args: argparse.Namespace,
-    batch_id: str,
-    logger: logging.Logger,
-) -> SourceIntake:
-    """Resolve the source workbook, archiving raw bytes before anything parses it.
-
-    --excel bypasses the queue entirely and is never archived or cleared: it is
-    an explicit override, so the caller owns that file.
-    """
+def take_next_file(modules, args, batch_id: str, logger: logging.Logger) -> SourceIntake:
+    """Take the workbook waiting in data/, archive it, and register it."""
+    # --excel is an explicit override: the caller owns that file, so it is
+    # neither archived nor cleared.
     if getattr(args, "excel", None):
         logger.info("Using explicit --excel override: %s", args.excel)
-        return SourceIntake(Path(args.excel), None, None, None, None)
+        return SourceIntake(path=Path(args.excel))
 
-    try:
-        original = discover_source_workbook()
-    except NoSourceFile as exc:
-        return SourceIntake(None, None, None, None, None, skip_reason=str(exc))
+    waiting = sorted(
+        p for p in DATA_DIR.glob("*.xlsx") if p.is_file() and not p.name.startswith("~$")
+    )
+    if not waiting:
+        # An empty queue is success, not failure - normal for a scheduled run.
+        return SourceIntake(skip_reason=f"no .xlsx waiting in {DATA_DIR}")
+    if len(waiting) > 1:
+        names = ", ".join(p.name for p in waiting)
+        raise RuntimeError(
+            f"{len(waiting)} workbooks in {DATA_DIR} ({names}). "
+            "Leave exactly one, or pass --excel to choose explicitly."
+        )
 
+    original = waiting[0]
     file_hash = file_sha256(original)
     logger.info("Source file: %s (sha256 %s...)", original.name, file_hash[:12])
 
     # validate-only must not touch the database or the queue
     if getattr(args, "validate_only", False):
         logger.info("validate-only: reading in place, not archiving")
-        return SourceIntake(original, None, None, None, file_hash)
+        return SourceIntake(path=original)
 
-    with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as conn:
-        previous = registry_previous_success(conn, file_hash)
-        if previous and not getattr(args, "force", False):
+    with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as conn, conn.cursor() as cur:
+        # Loading identical bytes again is safe for the data - every load is a
+        # MERGE - but it stamps UPDATED_DATE on every row it touches, and that
+        # column is what the INC_LOAD_* procedures filter on. A repeat load
+        # would push the whole dataset through the OLAP layer for nothing.
+        cur.execute(
+            """SELECT ARCHIVE_PATH, TO_CHAR(PROCESSED_AT, 'YYYY-MM-DD HH24:MI:SS')
+                 FROM ETL_FILE_REGISTRY
+                WHERE FILE_HASH = :h AND STATUS = 'SUCCESS'
+                ORDER BY FILE_ID DESC FETCH FIRST 1 ROWS ONLY""",
+            {"h": file_hash},
+        )
+        already = cur.fetchone()
+        if already and not getattr(args, "force", False):
             return SourceIntake(
-                None, original, None, None, file_hash,
-                skip_reason=(
-                    f"identical file already loaded at {previous[1]} "
-                    f"(archived: {previous[0]}). Use --force to reload."
-                ),
+                original=original,
+                skip_reason=f"identical file already loaded at {already[1]} "
+                            f"(archived: {already[0]}). Use --force to reload.",
             )
-        if previous:
-            logger.warning("--force: reloading a file already loaded at %s", previous[1])
+        if already:
+            logger.warning("--force: reloading a file already loaded at %s", already[1])
 
-        archive_path = archive_source_file(original, logger)
-        file_id = registry_register(conn, batch_id, original, file_hash, archive_path, logger)
+        # archive the raw bytes, date-partitioned and timestamped
+        stamp = datetime.now()
+        target_dir = ARCHIVE_DIR / f"{stamp:%Y}" / f"{stamp:%m}" / f"{stamp:%d}"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        archived = target_dir / f"{original.stem}_{stamp:%Y-%m-%d_%H-%M-%S}{original.suffix}"
+        shutil.copy2(original, archived)
+        if archived.stat().st_size != original.stat().st_size:
+            raise RuntimeError(f"Archive copy size mismatch: {archived}")
+        logger.info("Archived source file: %s", archived)
 
-    # read the archived copy: it is immutable for the rest of the run
-    return SourceIntake(archive_path, original, archive_path, file_id, file_hash)
+        # SIZE is an Oracle reserved word, so bind names are prefixed
+        new_file_id = cur.var(int)
+        cur.execute(
+            """INSERT INTO ETL_FILE_REGISTRY
+                   (FILE_NAME, FILE_HASH, FILE_SIZE, ARCHIVE_PATH, STATUS, BATCH_ID)
+               VALUES (:file_name, :file_hash, :file_size, :archive_path,
+                       'IN_PROGRESS', :batch_id)
+               RETURNING FILE_ID INTO :new_file_id""",
+            {
+                "file_name": original.name,
+                "file_hash": file_hash,
+                "file_size": original.stat().st_size,
+                "archive_path": str(archived),
+                "batch_id": batch_id,
+                "new_file_id": new_file_id,
+            },
+        )
+        conn.commit()
+        file_id = int(new_file_id.getvalue()[0])
+
+    # the run reads the archived copy: it is immutable for the rest of the run
+    return SourceIntake(path=archived, original=original, file_id=file_id)
 
 
-def finish_source_intake(
-    modules: "OltpModules",
+def release_file(
+    modules,
     intake: SourceIntake,
     status: str,
     logger: logging.Logger,
     error_message: str | None = None,
 ) -> None:
-    """Close out the queue entry: clear data/ on success, quarantine on failure."""
+    """Close the queue entry: clear data/ on success, quarantine a bad file."""
     if intake.file_id is None and intake.original is None:
         return
-    try:
-        with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as conn:
-            registry_finish(conn, intake.file_id, status, logger, error_message)
-    except Exception as exc:
-        logger.warning("Could not close the file registry entry: %s", exc)
+
+    if intake.file_id is not None:
+        try:
+            with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE ETL_FILE_REGISTRY
+                          SET STATUS = :status,
+                              PROCESSED_AT = SYSTIMESTAMP,
+                              ERROR_MESSAGE = :error_message
+                        WHERE FILE_ID = :file_id""",
+                    {
+                        "status": status,
+                        "error_message": (error_message or "")[:4000] or None,
+                        "file_id": intake.file_id,
+                    },
+                )
+                conn.commit()
+            logger.info("File registry updated: FILE_ID=%s %s", intake.file_id, status)
+        except Exception as exc:
+            logger.warning("Could not update the file registry: %s", exc)
 
     if intake.original is None or not intake.original.exists():
         return
+
     if status == "SUCCESS":
-        clear_processed_source(intake.original, logger)
-    elif is_retryable_error(error_message):
-        # The file is fine; the infrastructure was not. Quarantining here would
-        # silently empty the queue after a network blip, and every later run
-        # would report "nothing to process" while looking perfectly healthy.
+        intake.original.unlink()
+        logger.info("Removed %s from the data folder (archived copy retained)",
+                    intake.original.name)
+        return
+
+    message = (error_message or "").lower()
+    if any(marker.lower() in message for marker in RETRYABLE_ERRORS):
         logger.warning(
             "Leaving %s in the data folder to retry: the failure looks like an "
             "infrastructure problem, not a bad file (%s)",
-            intake.original.name,
-            (error_message or "")[:120],
+            intake.original.name, (error_message or "")[:120],
         )
-    else:
-        quarantine_source(intake.original, logger)
+        return
+
+    QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+    target = QUARANTINE_DIR / (
+        f"{intake.original.stem}_{datetime.now():%Y-%m-%d_%H-%M-%S}{intake.original.suffix}"
+    )
+    shutil.move(str(intake.original), str(target))
+    logger.warning("Moved failed file to quarantine: %s", target)
 
 
 def record_table_audit(
