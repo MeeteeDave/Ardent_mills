@@ -9,7 +9,7 @@ archive_unrequired_files/
 # Generated at runtime - the database (ETL_AUDIT / ETL_ERROR) is the run history
 pipelines/logs/
 pipelines/errors/
-pipelines/history/incremental_history.xlsx
+pipelines/history/load_history.xlsx
 
 # data/ is a work queue and archive/ is local run history - neither belongs in git.
 # A reference copy of the workbook is kept in samples/.

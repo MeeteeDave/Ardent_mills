@@ -274,7 +274,7 @@ py run_pipeline.py -v                  # full log output
 The project uses one common log file:
 
 ```text
-pipelines/logs/inc_pipeline.log
+pipelines/logs/pipeline.log
 ```
 
 Every pipeline run appends to the same file. This avoids creating a new log file for every run.
@@ -297,7 +297,7 @@ The log file records:
 All pipeline errors are written into one common error file:
 
 ```text
-pipelines/errors/inc_pipeline_errors.csv
+pipelines/errors/errors.csv
 ```
 
 The error file contains:
@@ -351,7 +351,7 @@ SELECT a.BATCH_ID, a.TARGET_TABLE, a.ERROR_MESSAGE, e.ERROR_TYPE
 The incremental history workbook is:
 
 ```text
-pipelines/history/incremental_history.xlsx
+pipelines/history/load_history.xlsx
 ```
 
 This file stores only detected `INSERT` and `UPDATE` changes from incremental runs.
@@ -367,7 +367,7 @@ How it works:
 1. The pipeline compares the newly transformed tables with the previous snapshot.
 2. If a row is new, it is marked as `INSERT`.
 3. If an existing row changed, it is marked as `UPDATE`.
-4. Only inserts and updates are appended to `incremental_history.xlsx`.
+4. Only inserts and updates are appended to `load_history.xlsx`.
 5. The latest full transformed state is saved into `current_snapshot.json`.
 
 This avoids creating a new history Excel file for every run.
@@ -414,7 +414,7 @@ for all generated-ID tables.
 The manifest file is:
 
 ```text
-pipelines/logs/inc_pipeline_manifest.jsonl
+pipelines/logs/run_manifest.jsonl
 ```
 
 It stores one JSON record per pipeline run.
@@ -644,13 +644,13 @@ Project details:
   2. run_pipeline.py: runs the OLTP load, then RUN_INCREMENTAL_OLAP_LOAD to load DIM_* and FACT_* tables.
   3. run_pipeline.py: runs both stages in order and stops at the first failure.
 - A config file named pipelines/config/pipeline_config.json stores paths, Oracle details, output locations, and OLAP control settings.
-- Logs are appended to pipelines/logs/inc_pipeline.log.
-- Errors are appended to pipelines/errors/inc_pipeline_errors.csv.
+- Logs are appended to pipelines/logs/pipeline.log.
+- Errors are appended to pipelines/errors/errors.csv.
 - Run history is stored in Oracle: ETL_AUDIT (run summary plus one row per target table), ETL_ERROR (one row per failure), ETL_FILE_REGISTRY (one row per source file, keyed on SHA-256), ETL_LOAD_CONTROL (the incremental watermark).
 - Source files are archived to archive/YYYY/MM/DD/ with a timestamp before being parsed; failures go to quarantine/.
-- Incremental history is stored in pipelines/history/incremental_history.xlsx.
+- Incremental history is stored in pipelines/history/load_history.xlsx.
 - The latest snapshot baseline is stored in pipelines/history/current_snapshot.json.
-- Run manifests are stored in pipelines/logs/inc_pipeline_manifest.jsonl.
+- Run manifests are stored in pipelines/logs/run_manifest.jsonl.
 - ID generation has been fixed so generated IDs are preserved from the previous snapshot using business keys instead of row position.
 - The project supports scheduling by running run_pipeline.py; an empty data/ folder exits 0 so frequent schedules are cheap.
 

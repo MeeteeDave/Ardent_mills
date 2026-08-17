@@ -61,13 +61,13 @@ PIPELINE_DIR = PROJECT_DIR / "pipelines"
 LOG_DIR = configured_path(PATH_CONFIG.get("log_dir"), PIPELINE_DIR / "logs")
 ERROR_DIR = configured_path(PATH_CONFIG.get("error_dir"), PIPELINE_DIR / "errors")
 HISTORY_DIR = configured_path(PATH_CONFIG.get("history_dir"), PIPELINE_DIR / "history")
-LOG_FILE = configured_path(PATH_CONFIG.get("log_file"), LOG_DIR / "inc_pipeline.log")
-ERROR_FILE = configured_path(PATH_CONFIG.get("error_file"), ERROR_DIR / "inc_pipeline_errors.csv")
-HISTORY_FILE = configured_path(PATH_CONFIG.get("history_file"), HISTORY_DIR / "incremental_history.xlsx")
+LOG_FILE = configured_path(PATH_CONFIG.get("log_file"), LOG_DIR / "pipeline.log")
+ERROR_FILE = configured_path(PATH_CONFIG.get("error_file"), ERROR_DIR / "errors.csv")
+HISTORY_FILE = configured_path(PATH_CONFIG.get("history_file"), HISTORY_DIR / "load_history.xlsx")
 SNAPSHOT_FILE = configured_path(PATH_CONFIG.get("snapshot_file"), HISTORY_DIR / "current_snapshot.json")
 MANIFEST_FILE = configured_path(
     PATH_CONFIG.get("manifest_file"),
-    LOG_DIR / "inc_pipeline_manifest.jsonl",
+    LOG_DIR / "run_manifest.jsonl",
 )
 
 OLTP_PROJECT_ROOT = configured_path(
@@ -423,7 +423,7 @@ def verify_oracle_row_counts(
 
 
 
-def update_incremental_history(
+def update_load_history(
     modules: OltpModules,
     run_id: str,
     pipeline_name: str,

@@ -61,7 +61,7 @@ from pipeline_common import (  # noqa: E402
     send_pipeline_alert,
     take_next_file,
     timestamp,
-    update_incremental_history,
+    update_load_history,
     verify_oracle_row_counts,
     write_error_record,
     write_run_manifest,
@@ -142,8 +142,8 @@ def load_staging(modules, args, excel_path, run_id, logger):
     modules.run_all_tables(tables, DEFAULT_ORACLE_CONFIG)
     verify_oracle_row_counts(modules.open_oracle_connection, OLTP_TABLES, DEFAULT_ORACLE_CONFIG)
 
-    history_path, history_rows = update_incremental_history(modules, run_id, PIPELINE_NAME, tables)
-    logger.info("Incremental history workbook: %s (%d rows)", history_path, history_rows)
+    history_path, history_rows = update_load_history(modules, run_id, PIPELINE_NAME, tables)
+    logger.info("Load history workbook: %s (%d rows)", history_path, history_rows)
     return raw, tables, summary_df
 
 

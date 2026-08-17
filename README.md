@@ -169,10 +169,10 @@ py run_pipeline.py -v                 # full log output
 ## Runtime Outputs
 
 ```text
-pipelines/logs/inc_pipeline.log
-pipelines/logs/inc_pipeline_manifest.jsonl
-pipelines/errors/inc_pipeline_errors.csv
-pipelines/history/incremental_history.xlsx
+pipelines/logs/pipeline.log
+pipelines/logs/run_manifest.jsonl
+pipelines/errors/errors.csv
+pipelines/history/load_history.xlsx
 pipelines/history/current_snapshot.json
 ```
 
