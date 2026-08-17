@@ -43,7 +43,7 @@ Logs, Errors, Reconciliation, History, Audit Control
 The original OLTP package is kept as the source of truth:
 
 ```text
-Ardent mill etl pipline/Ardent mill etl pipline/ardent_mills_etl
+ardent_mills_etl
 ```
 
 The production wrapper scripts are kept here:
@@ -55,19 +55,21 @@ production_pipelines
 ## 3. Main Folder Structure
 
 ```text
-Ardent Mills project/
+Ardent_mills/
 |
-|-- Ardent_Mills_Data.xlsx
+|-- data/
+|   |-- Ardent_Mills_Data.xlsx
 |
-|-- Ardent mill etl pipline/
-|   |-- Ardent mill etl pipline/
-|       |-- ardent_mills_etl/
-|           |-- transformers/
-|           |-- loaders/
-|           |-- utils/
-|           |-- config/
-|           |-- sql/
-|           |-- tests/
+|-- sql/
+|   |-- 01_tables.sql
+|   |-- 02_procedures.sql
+|
+|-- ardent_mills_etl/
+|   |-- transformers/
+|   |-- loaders/
+|   |-- utils/
+|   |-- config/
+|   |-- tests/
 |
 |-- production_pipelines/
 |   |-- 01_oltp_load_pipeline.py

@@ -20,59 +20,62 @@ Incremental OLAP stored procedures
 DIM_* and FACT_* Oracle OLAP tables
         |
         v
-Logs, errors, manifests, reconciliation, history, audit/control output, email alerts
+ETL_AUDIT / ETL_ERROR / ETL_LOAD_CONTROL tables, plus logs, reconciliation and email alerts
 ```
 
 ## Project Layout
 
 ```text
-Ardent Mills project/
+Ardent_mills/
 |-- .env                         # Local secrets only, ignored by Git
 |-- .env.example                 # Safe template for required environment variables
-|-- Ardent_Mills_Data.xlsx       # Source workbook
+|-- requirements.txt             # Python dependencies
 |-- README.md
 |
-|-- Ardent mill etl pipline/
-|   |-- Ardent mill etl pipline/
-|       |-- ardent_mills_etl/
-|           |-- main.py
-|           |-- requirements.txt
-|           |-- config/
-|           |-- loaders/
-|           |-- sql/
-|           |-- tests/
-|           |-- transformers/
-|           |-- utils/
+|-- data/
+|   |-- Ardent_Mills_Data.xlsx   # Source workbook
+|
+|-- sql/
+|   |-- 01_tables.sql            # All sequences and tables (OLTP + OLAP + ETL control)
+|   |-- 02_procedures.sql        # All incremental load procedures and wrappers
+|
+|-- ardent_mills_etl/            # OLTP ETL package (Excel -> ARD_OPS_* tables)
+|   |-- main.py
+|   |-- config/
+|   |-- loaders/
+|   |-- tests/
+|   |-- transformers/
+|   |-- utils/
+|
+|-- orchestration/
+|   |-- run_all.py               # Single entry point: runs every stage in order
 |
 |-- production_pipelines/
 |   |-- 01_oltp_load_pipeline.py
 |   |-- 02_oltp_to_olap_incremental_pipeline.py
-|   |-- 03_audit_control_pipeline.py
 |   |-- pipeline_common.py
-|   |-- config/
-|   |-- deploy/
-|   |-- errors/
+|   |-- config/                  # Optional pipeline_config.json, ignored by Git
+|   |-- errors/                  # Generated at runtime
 |   |-- history/
-|   |-- logs/
-|   |-- reconciliation/
-|   |-- sql/
+|   |-- logs/                    # Generated at runtime
+|   |-- reconciliation/          # Generated at runtime
 |   |-- END_TO_END_DOCUMENTATION.md
 ```
 
 ## Key Components
 
-- `Ardent mill etl pipline/Ardent mill etl pipline/ardent_mills_etl`: original OLTP ETL package. It reads Excel sheets, transforms data, validates relationships, and loads Oracle `ARD_OPS_*` tables with MERGE/upsert logic.
+- `ardent_mills_etl`: original OLTP ETL package. It reads Excel sheets, transforms data, validates relationships, and loads Oracle `ARD_OPS_*` tables with MERGE/upsert logic.
 - `production_pipelines/01_oltp_load_pipeline.py`: production OLTP load wrapper. It runs Excel extraction, transformations, validation, Oracle load, row-count reconciliation, and incremental history.
 - `production_pipelines/02_oltp_to_olap_incremental_pipeline.py`: main end-to-end incremental pipeline. It can run the OLTP load and then execute OLAP incremental procedures for `DIM_*` and `FACT_*` tables.
-- `production_pipelines/03_audit_control_pipeline.py`: audit/control step. It writes database row-count reconciliation and control output.
+- `orchestration/run_all.py`: single entry point. Runs each stage in dependency order and stops at the first failure.
 - `production_pipelines/pipeline_common.py`: shared config loading, logging, paths, Oracle config, reconciliation helpers, manifest writing, and email alerting.
 
 ## Setup
 
-Install Python dependencies from the original package:
+Install Python dependencies:
 
 ```powershell
-py -m pip install -r "Ardent mill etl pipline\Ardent mill etl pipline\ardent_mills_etl\requirements.txt"
+py -m pip install -r requirements.txt
 ```
 
 Create local environment settings:
@@ -126,7 +129,6 @@ Alerts are sent on both success and failure for:
 
 - `01_oltp_load_pipeline.py`
 - `02_oltp_to_olap_incremental_pipeline.py`
-- `03_audit_control_pipeline.py`
 
 To enable alerts, set this in `.env`:
 
@@ -150,24 +152,18 @@ Run the main incremental pipeline:
 py .\production_pipelines\02_oltp_to_olap_incremental_pipeline.py
 ```
 
-Run audit/control reconciliation:
+Run everything end to end (the normal entry point):
 
 ```powershell
-py .\production_pipelines\03_audit_control_pipeline.py
+py orchestration\run_all.py
 ```
 
-Run all production steps on Windows:
+Useful variants:
 
 ```powershell
-.\production_pipelines\deploy\run_all_production_pipelines.ps1
-```
-
-Run all production steps in WSL/Linux:
-
-```bash
-cd "/mnt/c/Users/samir/OneDrive/Desktop/New folder (2)/Ardent Mills project"
-chmod +x production_pipelines/deploy/run_all_production_pipelines.sh
-./production_pipelines/deploy/run_all_production_pipelines.sh
+py orchestration\run_all.py --validate-only    # no database writes
+py orchestration\run_all.py --only oltp        # a single stage
+py orchestration\run_all.py -v                 # full log output
 ```
 
 ## Common Options
@@ -178,7 +174,6 @@ chmod +x production_pipelines/deploy/run_all_production_pipelines.sh
 - `--skip-oltp`: for pipeline `02`, skip the OLTP load step.
 - `--skip-olap`: for pipeline `02`, skip OLAP procedure execution.
 - `--load-date "YYYY-MM-DD HH:MM:SS"`: override the previous OLAP load date.
-- `--skip-db-counts`: for pipeline `03`, skip database row-count checks.
 
 ## Runtime Outputs
 
@@ -198,11 +193,18 @@ production_pipelines/history/current_snapshot.json
 
 The OLTP package loads `ARD_OPS_*` operational tables. The production OLAP pipeline then runs `RUN_INCREMENTAL_OLAP_LOAD` if it exists; otherwise it runs the individual incremental procedures listed in `pipeline_common.py`.
 
-The project expects Oracle control/audit support tables and OLAP procedures to exist. Supporting SQL is kept under:
+All Oracle objects are kept in two files, extracted from the live schema:
 
 ```text
-production_pipelines/sql/
-Ardent mill etl pipline/Ardent mill etl pipline/ardent_mills_etl/sql/
+sql/01_tables.sql        # 16 sequences + 38 tables (ARD_OPS_*, DIM_*/FACT_*, ETL_*)
+sql/02_procedures.sql    # 16 INC_LOAD_* procedures + orchestration wrappers
+```
+
+Deploy a fresh schema by running them in order:
+
+```powershell
+sqlplus user/pass@dsn @sql/01_tables.sql
+sqlplus user/pass@dsn @sql/02_procedures.sql
 ```
 
 ## Git And Security Notes
@@ -216,3 +218,20 @@ Detailed operational documentation is available in:
 ```text
 production_pipelines/END_TO_END_DOCUMENTATION.md
 ```
+
+## Run History In The Database
+
+Run history is recorded in Oracle rather than in local files, so it survives the
+loss of any one working copy and is visible to everyone on the schema.
+
+```text
+ETL_AUDIT          one row per pipeline run: batch id, pipeline, row counts,
+                   status, error message, start/finish, duration
+ETL_ERROR          one row per failure: batch id, stage, error type, message,
+                   full traceback
+ETL_LOAD_CONTROL   the incremental watermark the OLAP procedures read
+```
+
+Every run stamps a 32-character `BATCH_ID`, so a run's audit row and its error
+rows join on that column. Audit writes are wrapped and never fail a load: if
+history cannot be written the pipeline logs a warning and its own result stands.

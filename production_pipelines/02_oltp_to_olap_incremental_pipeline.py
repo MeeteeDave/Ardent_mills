@@ -13,7 +13,10 @@ from pipeline_common import (
     add_common_args,
     configure_logging,
     load_oltp_modules,
+    new_batch_id,
     parse_load_date,
+    record_audit,
+    record_error,
     send_pipeline_alert,
     timestamp,
     update_incremental_history,
@@ -127,8 +130,14 @@ def run_olap_procedures(open_oracle_connection, load_date: datetime, logger) -> 
         try:
             with conn.cursor() as cursor:
                 if oracle_procedure_exists(cursor, "RUN_INCREMENTAL_OLAP_LOAD"):
-                    logger.info("Running RUN_INCREMENTAL_OLAP_LOAD")
-                    cursor.callproc("RUN_INCREMENTAL_OLAP_LOAD")
+                    logger.info(
+                        "Running RUN_INCREMENTAL_OLAP_LOAD with LOAD_DATE=%s", load_date
+                    )
+                    # The wrapper owns the control row: it stamps the watermark from
+                    # the database clock and sets SUCCESS/FAILED itself, so the row
+                    # stays correct even when the procedure is run outside this
+                    # pipeline. Do not overwrite it from the client clock here.
+                    cursor.callproc("RUN_INCREMENTAL_OLAP_LOAD", [load_date])
                 else:
                     logger.info(
                         "RUN_INCREMENTAL_OLAP_LOAD not found; running individual OLAP procedures"
@@ -136,7 +145,7 @@ def run_olap_procedures(open_oracle_connection, load_date: datetime, logger) -> 
                     for procedure_name in OLAP_LOAD_ORDER:
                         logger.info("Running %s with LOAD_DATE=%s", procedure_name, load_date)
                         cursor.callproc(procedure_name, [load_date])
-                mark_control_status(conn, "SUCCESS", load_start_date)
+                    mark_control_status(conn, "SUCCESS", load_start_date)
         except Exception:
             conn.rollback()
             try:
@@ -152,6 +161,9 @@ def main() -> None:
     run_id = timestamp()
     logger = configure_logging(PIPELINE_NAME, run_id)
     modules = load_oltp_modules()
+    batch_id = new_batch_id()
+    started_at = datetime.now()
+    logger.info("Batch id: %s", batch_id)
 
     raw = None
     tables = None
@@ -238,6 +250,18 @@ def main() -> None:
         )
         logger.info("Reconciliation workbook: %s", recon_path)
         logger.info("Run manifest: %s", manifest_path)
+        if not args.validate_only:
+            with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
+                record_audit(
+                    audit_conn, batch_id, PIPELINE_NAME, "SUCCESS", started_at, logger,
+                    source_object=str(args.excel),
+                    target_table="DIM_* / FACT_*",
+                    rows_loaded=(
+                        int(olap_counts["database_rows"].sum())
+                        if olap_counts is not None and not olap_counts.empty
+                        else None
+                    ),
+                )
         logger.info("OLTP-to-OLAP incremental pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
@@ -254,6 +278,20 @@ def main() -> None:
             run_id,
             {"status": "FAILED", "excel": str(args.excel), "error_file": str(error_path)},
         )
+        if not args.validate_only:
+            try:
+                with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
+                    record_error(
+                        audit_conn, batch_id, PIPELINE_NAME, "OLTP_TO_OLAP", exc, logger,
+                        target_table="DIM_* / FACT_*",
+                    )
+                    record_audit(
+                        audit_conn, batch_id, PIPELINE_NAME, "FAILED", started_at, logger,
+                        source_object=str(args.excel), target_table="DIM_* / FACT_*",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
+            except Exception as audit_exc:
+                logger.warning("Could not record failure in the database: %s", audit_exc)
         logger.exception("OLTP-to-OLAP pipeline failed. Error file: %s", error_path)
         send_pipeline_alert(
             PIPELINE_NAME,

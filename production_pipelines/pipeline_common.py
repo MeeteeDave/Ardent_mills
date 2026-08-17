@@ -8,6 +8,7 @@ import os
 import smtplib
 import sys
 import traceback
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -83,12 +84,12 @@ DIAGNOSTICS_JSON_FILE = configured_path(
 
 OLTP_PROJECT_ROOT = configured_path(
     PATH_CONFIG.get("oltp_project_root"),
-    PROJECT_DIR / "Ardent mill etl pipline" / "Ardent mill etl pipline",
+    PROJECT_DIR,
 )
 OLTP_PACKAGE_DIR = OLTP_PROJECT_ROOT / "ardent_mills_etl"
 DEFAULT_EXCEL_PATH = configured_path(
     PATH_CONFIG.get("source_excel"),
-    OLTP_PROJECT_ROOT / "Ardent_Mills_Data.xlsx",
+    PROJECT_DIR / "data" / "Ardent_Mills_Data.xlsx",
 )
 
 DEFAULT_ORACLE_CONFIG = {
@@ -549,3 +550,128 @@ def write_run_manifest(pipeline_name: str, run_id: str, values: dict[str, Any]) 
     with MANIFEST_FILE.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, default=str) + "\n")
     return MANIFEST_FILE
+
+
+# ---------------------------------------------------------------- ETL audit
+# Run history lives in the database, not in local CSV/Excel files: a file on one
+# machine is invisible to everyone else and was lost with the rest of the
+# working copy. ETL_AUDIT holds one row per pipeline run, ETL_ERROR one row per
+# failure, and ETL_LOAD_CONTROL is the watermark the OLAP procedures read.
+#
+# Auditing must never break a load. Every write here is wrapped: a failure to
+# record history is logged and swallowed, so the pipeline result stands on its
+# own.
+
+def new_batch_id() -> str:
+    """One id per pipeline run, stamped on its audit and error rows."""
+    return uuid.uuid4().hex
+
+
+def record_audit(
+    conn,
+    batch_id: str,
+    pipeline_name: str,
+    status: str,
+    started_at: datetime,
+    logger: logging.Logger,
+    *,
+    source_object: str | None = None,
+    target_table: str | None = None,
+    rows_read: int | None = None,
+    rows_loaded: int | None = None,
+    rows_inserted: int | None = None,
+    rows_updated: int | None = None,
+    rows_unchanged: int | None = None,
+    rows_rejected: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    finished_at = datetime.now()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ETL_AUDIT (
+                    BATCH_ID, PIPELINE_NAME, SOURCE_OBJECT, TARGET_TABLE,
+                    ROWS_READ, ROWS_LOADED, ROWS_INSERTED, ROWS_UPDATED,
+                    ROWS_UNCHANGED, ROWS_REJECTED, STATUS, ERROR_MESSAGE,
+                    STARTED_AT, FINISHED_AT, DURATION_SECONDS
+                ) VALUES (
+                    :batch_id, :pipeline_name, :source_object, :target_table,
+                    :rows_read, :rows_loaded, :rows_inserted, :rows_updated,
+                    :rows_unchanged, :rows_rejected, :status, :error_message,
+                    :started_at, :finished_at, :duration
+                )
+                """,
+                {
+                    "batch_id": batch_id,
+                    "pipeline_name": pipeline_name,
+                    "source_object": source_object,
+                    "target_table": target_table,
+                    "rows_read": rows_read,
+                    "rows_loaded": rows_loaded,
+                    "rows_inserted": rows_inserted,
+                    "rows_updated": rows_updated,
+                    "rows_unchanged": rows_unchanged,
+                    "rows_rejected": rows_rejected,
+                    "status": status,
+                    "error_message": (error_message or "")[:4000] or None,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "duration": round((finished_at - started_at).total_seconds(), 2),
+                },
+            )
+        conn.commit()
+        logger.info("Audit row written: %s %s (batch %s)", pipeline_name, status, batch_id)
+    except Exception as exc:
+        logger.warning("Could not write ETL_AUDIT row: %s", exc)
+
+
+def record_error(
+    conn,
+    batch_id: str,
+    pipeline_name: str,
+    stage: str,
+    exc: BaseException,
+    logger: logging.Logger,
+    *,
+    target_table: str | None = None,
+    record_key: str | None = None,
+) -> None:
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ETL_ERROR (
+                    BATCH_ID, PIPELINE_NAME, STAGE, TARGET_TABLE,
+                    RECORD_KEY, ERROR_TYPE, ERROR_MESSAGE, ERROR_DETAIL
+                ) VALUES (
+                    :batch_id, :pipeline_name, :stage, :target_table,
+                    :record_key, :error_type, :error_message, :error_detail
+                )
+                """,
+                {
+                    "batch_id": batch_id,
+                    "pipeline_name": pipeline_name,
+                    "stage": stage,
+                    "target_table": target_table,
+                    "record_key": record_key,
+                    "error_type": type(exc).__name__[:200],
+                    "error_message": str(exc)[:4000],
+                    "error_detail": traceback.format_exc(),
+                },
+            )
+        conn.commit()
+        logger.info("Error row written to ETL_ERROR (batch %s)", batch_id)
+    except Exception as write_exc:
+        logger.warning("Could not write ETL_ERROR row: %s", write_exc)
+
+
+def get_watermark(conn, process_name: str) -> datetime | None:
+    """Read the incremental watermark from ETL_LOAD_CONTROL."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT LAST_LOAD_DATE FROM ETL_LOAD_CONTROL WHERE PROCESS_NAME = :p",
+            {"p": process_name},
+        )
+        row = cursor.fetchone()
+    return row[0] if row else None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from pipeline_common import (
@@ -11,6 +12,9 @@ from pipeline_common import (
     add_common_args,
     configure_logging,
     load_oltp_modules,
+    new_batch_id,
+    record_audit,
+    record_error,
     send_pipeline_alert,
     timestamp,
     update_incremental_history,
@@ -37,6 +41,10 @@ def main() -> None:
     run_id = timestamp()
     logger = configure_logging(PIPELINE_NAME, run_id)
     modules = load_oltp_modules()
+
+    batch_id = new_batch_id()
+    started_at = datetime.now()
+    logger.info("Batch id: %s", batch_id)
 
     validation_output = args.validation_output or VALIDATION_WORKBOOK_FILE
     diagnostics_output = args.diagnostics_output or DIAGNOSTICS_JSON_FILE
@@ -106,6 +114,15 @@ def main() -> None:
         )
         logger.info("Reconciliation workbook: %s", recon_path)
         logger.info("Run manifest: %s", manifest_path)
+        if not args.validate_only:
+            with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
+                record_audit(
+                    audit_conn, batch_id, PIPELINE_NAME, "SUCCESS", started_at, logger,
+                    source_object=str(args.excel),
+                    target_table="ARD_OPS_*",
+                    rows_read=int(sum(len(df) for df in raw.values())),
+                    rows_loaded=int(sum(len(df) for df in tables.values())),
+                )
         logger.info("OLTP pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
@@ -122,6 +139,20 @@ def main() -> None:
             run_id,
             {"status": "FAILED", "excel": str(args.excel), "error_file": str(error_path)},
         )
+        if not args.validate_only:
+            try:
+                with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
+                    record_error(
+                        audit_conn, batch_id, PIPELINE_NAME, "OLTP_LOAD", exc, logger,
+                        target_table="ARD_OPS_*",
+                    )
+                    record_audit(
+                        audit_conn, batch_id, PIPELINE_NAME, "FAILED", started_at, logger,
+                        source_object=str(args.excel), target_table="ARD_OPS_*",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
+            except Exception as audit_exc:
+                logger.warning("Could not record failure in the database: %s", audit_exc)
         logger.exception("OLTP pipeline failed. Error file: %s", error_path)
         send_pipeline_alert(
             PIPELINE_NAME,
