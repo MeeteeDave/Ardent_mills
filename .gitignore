@@ -11,3 +11,9 @@ production_pipelines/logs/
 production_pipelines/errors/
 production_pipelines/reconciliation/
 production_pipelines/history/incremental_history.xlsx
+
+# data/ is a work queue and archive/ is local run history - neither belongs in git.
+# A reference copy of the workbook is kept in samples/.
+data/*.xlsx
+archive/
+quarantine/

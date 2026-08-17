@@ -12,6 +12,8 @@ from pipeline_common import (
     OLTP_TABLES,
     add_common_args,
     configure_logging,
+    finish_source_intake,
+    intake_source_workbook,
     load_oltp_modules,
     new_batch_id,
     parse_load_date,
@@ -165,6 +167,16 @@ def main() -> None:
     started_at = datetime.now()
     logger.info("Batch id: %s", batch_id)
 
+    intake = None
+    excel_path = None
+    if not args.skip_oltp:
+        intake = intake_source_workbook(modules, args, batch_id, logger)
+        if intake.skip_reason:
+            logger.info("Nothing to process: %s", intake.skip_reason)
+            logger.info("Incremental pipeline finished with no work to do")
+            return
+        excel_path = intake.path
+
     raw = None
     tables = None
     summary_df = None
@@ -189,7 +201,7 @@ def main() -> None:
             logger.info("Skipping OLTP load")
         else:
             logger.info("Running original packaged OLTP pipeline first")
-            raw = modules.load_source_excel(args.excel)
+            raw = modules.load_source_excel(excel_path)
             tables, issues, details = modules.build_all_tables(raw)
             fk_issues = modules.find_foreign_key_issues(tables)
             for issue in fk_issues:
@@ -240,7 +252,7 @@ def main() -> None:
             run_id,
             {
                 "status": "SUCCESS",
-                "excel": str(args.excel),
+                "excel": str(excel_path),
                 "load_date": load_date,
                 "skip_oltp": args.skip_oltp,
                 "skip_olap": args.skip_olap,
@@ -254,7 +266,7 @@ def main() -> None:
             with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
                 record_audit(
                     audit_conn, batch_id, PIPELINE_NAME, "SUCCESS", started_at, logger,
-                    source_object=str(args.excel),
+                    source_object=str(excel_path),
                     target_table="DIM_* / FACT_*",
                     rows_loaded=(
                         int(olap_counts["database_rows"].sum())
@@ -262,6 +274,8 @@ def main() -> None:
                         else None
                     ),
                 )
+        if intake is not None:
+            finish_source_intake(modules, intake, "SUCCESS", logger)
         logger.info("OLTP-to-OLAP incremental pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
@@ -276,7 +290,7 @@ def main() -> None:
         write_run_manifest(
             PIPELINE_NAME,
             run_id,
-            {"status": "FAILED", "excel": str(args.excel), "error_file": str(error_path)},
+            {"status": "FAILED", "excel": str(excel_path), "error_file": str(error_path)},
         )
         if not args.validate_only:
             try:
@@ -287,11 +301,15 @@ def main() -> None:
                     )
                     record_audit(
                         audit_conn, batch_id, PIPELINE_NAME, "FAILED", started_at, logger,
-                        source_object=str(args.excel), target_table="DIM_* / FACT_*",
+                        source_object=str(excel_path), target_table="DIM_* / FACT_*",
                         error_message=f"{type(exc).__name__}: {exc}",
                     )
             except Exception as audit_exc:
                 logger.warning("Could not record failure in the database: %s", audit_exc)
+        if intake is not None:
+            finish_source_intake(
+                modules, intake, "FAILED", logger, f"{type(exc).__name__}: {exc}"
+            )
         logger.exception("OLTP-to-OLAP pipeline failed. Error file: %s", error_path)
         send_pipeline_alert(
             PIPELINE_NAME,

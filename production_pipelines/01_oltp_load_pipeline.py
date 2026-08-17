@@ -11,6 +11,8 @@ from pipeline_common import (
     VALIDATION_WORKBOOK_FILE,
     add_common_args,
     configure_logging,
+    finish_source_intake,
+    intake_source_workbook,
     load_oltp_modules,
     new_batch_id,
     record_audit,
@@ -49,6 +51,13 @@ def main() -> None:
     validation_output = args.validation_output or VALIDATION_WORKBOOK_FILE
     diagnostics_output = args.diagnostics_output or DIAGNOSTICS_JSON_FILE
 
+    intake = intake_source_workbook(modules, args, batch_id, logger)
+    if intake.skip_reason:
+        logger.info("Nothing to process: %s", intake.skip_reason)
+        logger.info("OLTP pipeline finished with no work to do")
+        return
+    excel_path = intake.path
+
     try:
         if not args.validate_only and not args.skip_connection_test:
             ok, message = modules.test_oracle_connection(DEFAULT_ORACLE_CONFIG)
@@ -56,8 +65,8 @@ def main() -> None:
             if not ok:
                 raise RuntimeError(message)
 
-        logger.info("Reading source Excel: %s", args.excel)
-        raw = modules.load_source_excel(args.excel)
+        logger.info("Reading source Excel: %s", excel_path)
+        raw = modules.load_source_excel(excel_path)
         logger.info("Source sheet shapes: %s", {k: v.shape for k, v in raw.items()})
 
         logger.info("Transforming source sheets into ARD_OPS tables")
@@ -105,7 +114,7 @@ def main() -> None:
             run_id,
             {
                 "status": "SUCCESS",
-                "excel": str(args.excel),
+                "excel": str(excel_path),
                 "validation_output": str(validation_output),
                 "diagnostics_output": str(diagnostics_output),
                 "reconciliation_output": str(recon_path),
@@ -118,11 +127,12 @@ def main() -> None:
             with modules.open_oracle_connection(DEFAULT_ORACLE_CONFIG) as audit_conn:
                 record_audit(
                     audit_conn, batch_id, PIPELINE_NAME, "SUCCESS", started_at, logger,
-                    source_object=str(args.excel),
+                    source_object=str(excel_path),
                     target_table="ARD_OPS_*",
                     rows_read=int(sum(len(df) for df in raw.values())),
                     rows_loaded=int(sum(len(df) for df in tables.values())),
                 )
+        finish_source_intake(modules, intake, "SUCCESS", logger)
         logger.info("OLTP pipeline finished successfully")
         send_pipeline_alert(
             PIPELINE_NAME,
@@ -137,7 +147,7 @@ def main() -> None:
         write_run_manifest(
             PIPELINE_NAME,
             run_id,
-            {"status": "FAILED", "excel": str(args.excel), "error_file": str(error_path)},
+            {"status": "FAILED", "excel": str(excel_path), "error_file": str(error_path)},
         )
         if not args.validate_only:
             try:
@@ -148,11 +158,14 @@ def main() -> None:
                     )
                     record_audit(
                         audit_conn, batch_id, PIPELINE_NAME, "FAILED", started_at, logger,
-                        source_object=str(args.excel), target_table="ARD_OPS_*",
+                        source_object=str(excel_path), target_table="ARD_OPS_*",
                         error_message=f"{type(exc).__name__}: {exc}",
                     )
             except Exception as audit_exc:
                 logger.warning("Could not record failure in the database: %s", audit_exc)
+        finish_source_intake(
+            modules, intake, "FAILED", logger, f"{type(exc).__name__}: {exc}"
+        )
         logger.exception("OLTP pipeline failed. Error file: %s", error_path)
         send_pipeline_alert(
             PIPELINE_NAME,

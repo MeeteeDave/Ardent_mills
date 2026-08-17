@@ -32,8 +32,11 @@ Ardent_mills/
 |-- requirements.txt             # Python dependencies
 |-- README.md
 |
-|-- data/
-|   |-- Ardent_Mills_Data.xlsx   # Source workbook
+|-- data/                        # Work queue: drop the new workbook here
+|-- archive/                     # Timestamped copy of every file processed
+|-- quarantine/                  # Files that failed processing
+|-- samples/
+|   |-- Ardent_Mills_Data.xlsx   # Reference copy of the source workbook
 |
 |-- sql/
 |   |-- 01_tables.sql            # All sequences and tables (OLTP + OLAP + ETL control)
@@ -229,9 +232,49 @@ ETL_AUDIT          one row per pipeline run: batch id, pipeline, row counts,
                    status, error message, start/finish, duration
 ETL_ERROR          one row per failure: batch id, stage, error type, message,
                    full traceback
+ETL_FILE_REGISTRY  one row per source file: name, SHA-256, archive path, status
 ETL_LOAD_CONTROL   the incremental watermark the OLAP procedures read
 ```
 
 Every run stamps a 32-character `BATCH_ID`, so a run's audit row and its error
 rows join on that column. Audit writes are wrapped and never fail a load: if
 history cannot be written the pipeline logs a warning and its own result stands.
+
+## Source Files: Queue, Archive And Replay
+
+`data/` is a work queue. It holds only files still waiting to be processed, and
+a run leaves it empty.
+
+```text
+drop Ardent_Mills_Data.xlsx into data/
+  -> hash it (SHA-256)
+  -> already loaded with the same bytes?  -> log, skip, exit 0
+  -> copy raw file to archive/YYYY/MM/DD/<name>_<timestamp>.xlsx
+  -> register the file as IN_PROGRESS
+  -> process the ARCHIVED copy, not the original
+  -> success -> registry SUCCESS, original removed from data/
+  -> failure -> registry FAILED,  original moved to quarantine/
+```
+
+The raw bytes are archived **before** anything parses them, because the archive
+is the replay source: if the transformer crashes, what landed must still exist.
+The original is only removed after the load succeeds, so a file is never in a
+state where it exists nowhere.
+
+The SHA-256 check is not about protecting the data -- every load is a MERGE and
+is safe to repeat. It protects the *watermark*. Reloading identical bytes stamps
+`UPDATED_DATE` on every row it touches, and `UPDATED_DATE` is exactly what the
+`INC_LOAD_*` procedures filter on, so a redundant reload would push the whole
+dataset back through the OLAP layer for nothing.
+
+A failed file goes to `quarantine/` rather than staying in `data/`, where it
+would fail every scheduled run forever and block the next good file behind it.
+
+```powershell
+py orchestrationun_all.py                 # process whatever is in data/
+py production_pipelines_oltp_load_pipeline.py --force    # reload identical bytes
+py production_pipelines_oltp_load_pipeline.py --excel path	o\other.xlsx
+```
+
+`--excel` bypasses the queue entirely: that file is neither archived nor removed,
+because the caller owns it.
